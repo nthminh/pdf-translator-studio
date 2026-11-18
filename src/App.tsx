@@ -18,6 +18,7 @@ import {
   createSampleDocumentPages,
   snipImageRegionFromPage,
   exportPagesToPdf,
+  exportPagesToImages,
 } from './services/pdfService';
 import {
   translateTextBlocks,
@@ -66,6 +67,9 @@ export const App: React.FC = () => {
     () => localStorage.getItem('GEMINI_API_KEY') || ''
   );
   const [showKeyModal, setShowKeyModal] = useState<boolean>(false);
+  const [showExportModal, setShowExportModal] = useState<boolean>(false);
+  const [exportFileName, setExportFileName] = useState<string>('');
+  const [exportFormat, setExportFormat] = useState<'pdf' | 'png' | 'jpg'>('pdf');
   const [autoFitOnTranslate, setAutoFitOnTranslate] = useState<boolean>(true);
   const [mergeParagraphsOnLoad, setMergeParagraphsOnLoad] = useState<boolean>(true);
 
@@ -710,19 +714,48 @@ export const App: React.FC = () => {
     setLastStats('Đã khôi phục trang về văn bản và vị trí gốc.');
   };
 
-  // Export to PDF
-  const handleExportPdf = async () => {
+  // Open Export & Rename modal with suggested filename
+  const handleOpenExportModal = () => {
     if (pages.length === 0) return;
+    const strippedBase = documentName
+      .replace(/\.(pdf|png|jpe?g|webp|bmp)$/i, '')
+      .trim();
+    const suggested = `${strippedBase || 'Tai-lieu-da-dich'}_${targetLang}`;
+    setExportFileName(suggested);
+    setShowExportModal(true);
+  };
+
+  // Confirm rename & trigger download (PDF / PNG / JPG)
+  const handleConfirmExport = async () => {
+    if (pages.length === 0) return;
+    const safeBase =
+      exportFileName
+        .replace(/\.(pdf|png|jpe?g)$/i, '')
+        .replace(/[\\/:*?"<>|]+/g, '-')
+        .trim() || `Tai-lieu-da-dich_${targetLang}`;
+
+    setShowExportModal(false);
     setIsBusy(true);
-    setStatusMessage('Đang kết xuất file PDF chất lượng cao...');
+    setStatusMessage(
+      exportFormat === 'pdf'
+        ? 'Đang kết xuất file PDF chất lượng cao...'
+        : `Đang kết xuất file ảnh ${exportFormat.toUpperCase()} sắc nét...`
+    );
     try {
-      const outName = documentName.replace(/\.pdf$/i, '') + `_${targetLang}.pdf`;
-      await exportPagesToPdf(pages, outName, (cur, total) => {
-        setStatusMessage(`Đang xuất trang ${cur}/${total}...`);
-      });
-      setLastStats(`Đã xuất thành công file ${outName}`);
+      if (exportFormat === 'pdf') {
+        const outName = `${safeBase}.pdf`;
+        await exportPagesToPdf(pages, outName, (cur, total) => {
+          setStatusMessage(`Đang xuất trang ${cur}/${total}...`);
+        });
+        setLastStats(`Đã tải xuống thành công: ${outName}`);
+      } else {
+        await exportPagesToImages(pages, safeBase, exportFormat, (cur, total) => {
+          setStatusMessage(`Đang xuất ảnh trang ${cur}/${total}...`);
+        });
+        setLastStats(`Đã tải xuống thành công: ${safeBase}.${exportFormat}`);
+      }
     } catch (err: any) {
-      alert('Lỗi khi xuất PDF: ' + (err?.message || String(err)));
+      alert('Lỗi khi xuất file: ' + (err?.message || String(err)));
     } finally {
       setIsBusy(false);
       setStatusMessage('');
@@ -862,11 +895,12 @@ export const App: React.FC = () => {
 
           <button
             disabled={isBusy}
-            onClick={handleExportPdf}
+            onClick={handleOpenExportModal}
             className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-semibold text-white shadow-lg shadow-emerald-950/60 flex items-center gap-1.5 transition"
+            title="Đặt tên file và chọn định dạng tải xuống (PDF / PNG / JPG)"
           >
             <Download className="w-3.5 h-3.5" />
-            Xuất PDF
+            Xuất PDF / Ảnh
           </button>
         </div>
       </header>
@@ -1311,6 +1345,119 @@ export const App: React.FC = () => {
           onUploadNewImage={handleUploadNewImage}
         />
       </div>
+
+      {/* Export & Rename File Modal */}
+      {showExportModal && (
+        <div
+          onClick={() => setShowExportModal(false)}
+          className="fixed inset-0 bg-slate-950/75 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Download className="w-4 h-4 text-emerald-400" />
+                Đặt Tên File & Tải Xuống
+              </h3>
+              <button
+                onClick={() => setShowExportModal(false)}
+                className="text-xs text-slate-400 hover:text-white"
+              >
+                Đóng
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-medium text-slate-300">
+                Tên tệp tải về:
+              </label>
+              <div className="flex items-center rounded-xl bg-slate-950 border border-slate-700 focus-within:border-emerald-500 overflow-hidden">
+                <input
+                  type="text"
+                  autoFocus
+                  onFocus={(e) => e.currentTarget.select()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleConfirmExport();
+                    } else if (e.key === 'Escape') {
+                      setShowExportModal(false);
+                    }
+                  }}
+                  placeholder="Nhập tên file muốn lưu..."
+                  value={exportFileName}
+                  onChange={(e) => setExportFileName(e.target.value)}
+                  className="flex-1 bg-transparent px-3 py-2 text-xs text-white focus:outline-none"
+                />
+                <span className="px-3 py-2 bg-slate-800/80 text-emerald-300 text-xs font-mono border-l border-slate-700">
+                  .{exportFormat}
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-medium text-slate-300">
+                Định dạng xuất file:
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setExportFormat('pdf')}
+                  className={`px-2.5 py-2 rounded-xl border text-xs font-medium transition ${
+                    exportFormat === 'pdf'
+                      ? 'bg-emerald-600/20 border-emerald-500 text-emerald-200 shadow'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  📄 PDF (.pdf)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExportFormat('png')}
+                  className={`px-2.5 py-2 rounded-xl border text-xs font-medium transition ${
+                    exportFormat === 'png'
+                      ? 'bg-emerald-600/20 border-emerald-500 text-emerald-200 shadow'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  🖼️ Ảnh nét (.png)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExportFormat('jpg')}
+                  className={`px-2.5 py-2 rounded-xl border text-xs font-medium transition ${
+                    exportFormat === 'jpg'
+                      ? 'bg-emerald-600/20 border-emerald-500 text-emerald-200 shadow'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  🖼️ Ảnh nhẹ (.jpg)
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmExport}
+                className="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white shadow-lg shadow-emerald-950/60 flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Tải xuống ngay
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Gemini API Key Modal */}
       {showKeyModal && (

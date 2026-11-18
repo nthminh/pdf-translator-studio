@@ -1116,6 +1116,36 @@ export async function exportPagesToPdf(
   pdf.save(filename);
 }
 
+/**
+ * Exports pages as high-resolution PNG or JPG image files (ideal for translated Posters / Flyers).
+ */
+export async function exportPagesToImages(
+  pages: PageData[],
+  baseFilename: string = 'translated-poster',
+  format: 'png' | 'jpg' = 'png',
+  onProgress?: (pageNum: number, total: number) => void
+): Promise<void> {
+  if (pages.length === 0) return;
+
+  const cleanBase = baseFilename.replace(/\.(pdf|png|jpe?g|webp)$/i, '').trim() || 'translated-poster';
+  const mime = format === 'jpg' ? 'image/jpeg' : 'image/png';
+  const ext = format === 'jpg' ? 'jpg' : 'png';
+
+  for (let i = 0; i < pages.length; i++) {
+    onProgress?.(i + 1, pages.length);
+    const canvas = await renderCompositePageCanvas(pages[i], 2.5);
+    const dataUrl = format === 'jpg' ? canvas.toDataURL(mime, 0.95) : canvas.toDataURL(mime);
+
+    const suffix = pages.length > 1 ? `_trang_${i + 1}` : '';
+    const link = document.createElement('a');
+    link.href = dataUrl;
+    link.download = `${cleanBase}${suffix}.${ext}`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+}
+
 export interface VisionDetectedBox {
   ymin: number;
   xmin: number;
