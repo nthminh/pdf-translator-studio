@@ -1189,96 +1189,144 @@ function separateBgAndInkColors(
     }
 
     const data = srcCtx.getImageData(sx, sy, sw, sh).data;
-    // Seed background cluster from the perimeter border pixels of the box
-    const edgeR: number[] = [];
-    const edgeG: number[] = [];
-    const edgeB: number[] = [];
-    for (let cx = 0; cx < sw; cx += 2) {
-      const topIdx = cx * 4;
-      const botIdx = ((sh - 1) * sw + cx) * 4;
-      edgeR.push(data[topIdx], data[botIdx]);
-      edgeG.push(data[topIdx + 1], data[botIdx + 1]);
-      edgeB.push(data[topIdx + 2], data[botIdx + 2]);
-    }
-    for (let cy = 1; cy < sh - 1; cy += 2) {
-      const leftIdx = (cy * sw) * 4;
-      const rightIdx = (cy * sw + (sw - 1)) * 4;
-      edgeR.push(data[leftIdx], data[rightIdx]);
-      edgeG.push(data[leftIdx + 1], data[rightIdx + 1]);
-      edgeB.push(data[leftIdx + 2], data[rightIdx + 2]);
-    }
 
-    edgeR.sort((a, b) => a - b);
-    edgeG.sort((a, b) => a - b);
-    edgeB.sort((a, b) => a - b);
-    const eMid = Math.floor(edgeR.length / 2);
-    let c0R = edgeR[eMid] ?? 255;
-    let c0G = edgeG[eMid] ?? 255;
-    let c0B = edgeB[eMid] ?? 255;
+    // Sample from the core interior (8%..92% X, 10%..90% Y) so outside card borders,
+    // champagne glasses, pocket watches, or fireworks touching the outer edges NEVER invert bg vs fg!
+    const ix0 = sw >= 10 ? Math.floor(sw * 0.08) : 0;
+    const ix1 = sw >= 10 ? Math.ceil(sw * 0.92) : sw;
+    const iy0 = sh >= 10 ? Math.floor(sh * 0.1) : 0;
+    const iy1 = sh >= 10 ? Math.ceil(sh * 0.9) : sh;
 
-    // Seed ink cluster from the interior pixel farthest from c0
-    let c1R = c0R < 128 ? 255 : 15;
-    let c1G = c0G < 128 ? 255 : 23;
-    let c1B = c0B < 128 ? 255 : 42;
-    let maxDist = 0;
+    const samples: Array<{ r: number; g: number; b: number; lum: number }> = [];
+    const interiorArea = Math.max(1, (ix1 - ix0) * (iy1 - iy0));
+    const step = Math.max(1, Math.floor(Math.sqrt(interiorArea / 650)));
 
-    const totalPx = sw * sh;
-    const sampleStep = Math.max(1, Math.floor(totalPx / 600));
-    for (let p = 0; p < totalPx; p += sampleStep) {
-      const idx = p * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-      const d = Math.abs(r - c0R) + Math.abs(g - c0G) + Math.abs(b - c0B);
-      if (d > maxDist) {
-        maxDist = d;
-        c1R = r;
-        c1G = g;
-        c1B = b;
+    for (let cy = iy0; cy < iy1; cy += step) {
+      for (let cx = ix0; cx < ix1; cx += step) {
+        const idx = (cy * sw + cx) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        samples.push({ r, g, b, lum: 0.299 * r + 0.587 * g + 0.114 * b });
       }
     }
 
-    // 2-means k-means refinement (7 iterations) cleanly separates background vs letter ink without color mixing!
-    if (maxDist >= 42) {
-      for (let iter = 0; iter < 7; iter++) {
-        let s0R = 0, s0G = 0, s0B = 0, n0 = 0;
-        let s1R = 0, s1G = 0, s1B = 0, n1 = 0;
-        for (let p = 0; p < totalPx; p += sampleStep) {
-          const idx = p * 4;
-          const r = data[idx];
-          const g = data[idx + 1];
-          const b = data[idx + 2];
-          const d0 = Math.abs(r - c0R) + Math.abs(g - c0G) + Math.abs(b - c0B);
-          const d1 = Math.abs(r - c1R) + Math.abs(g - c1G) + Math.abs(b - c1B);
-          if (d0 <= d1) {
-            s0R += r; s0G += g; s0B += b; n0++;
+    if (samples.length === 0) {
+      return {
+        bgRgb: [255, 255, 255],
+        fgRgb: [15, 23, 42],
+        bgHex: '#ffffff',
+        fgHex: '#0f172a',
+      };
+    }
+
+    // Seed 2 clusters from dark (20th percentile) & light (85th percentile) interior luminance
+    // so initialization NEVER depends on noisy perimeter borders!
+    const sortedByLum = [...samples].sort((a, b) => a.lum - b.lum);
+    const pDark = sortedByLum[Math.floor(sortedByLum.length * 0.2)];
+    const pLight = sortedByLum[Math.min(sortedByLum.length - 1, Math.floor(sortedByLum.length * 0.85))];
+
+    let cAR = pDark.r,
+      cAG = pDark.g,
+      cAB = pDark.b;
+    let cBR = pLight.r,
+      cBG = pLight.g,
+      cBB = pLight.b;
+
+    let nA = 0,
+      nB = 0;
+    const initDist = Math.abs(cAR - cBR) + Math.abs(cAG - cBG) + Math.abs(cAB - cBB);
+
+    if (initDist >= 32) {
+      for (let iter = 0; iter < 10; iter++) {
+        let sAR = 0,
+          sAG = 0,
+          sAB = 0,
+          cntA = 0;
+        let sBR = 0,
+          sBG = 0,
+          sBB = 0,
+          cntB = 0;
+        for (const s of samples) {
+          const dA = Math.abs(s.r - cAR) + Math.abs(s.g - cAG) + Math.abs(s.b - cAB);
+          const dB = Math.abs(s.r - cBR) + Math.abs(s.g - cBG) + Math.abs(s.b - cBB);
+          if (dA <= dB) {
+            sAR += s.r;
+            sAG += s.g;
+            sAB += s.b;
+            cntA++;
           } else {
-            s1R += r; s1G += g; s1B += b; n1++;
+            sBR += s.r;
+            sBG += s.g;
+            sBB += s.b;
+            cntB++;
           }
         }
-        if (n0 > 0) { c0R = s0R / n0; c0G = s0G / n0; c0B = s0B / n0; }
-        if (n1 > 0) { c1R = s1R / n1; c1G = s1G / n1; c1B = s1B / n1; }
+        if (cntA > 0) {
+          cAR = sAR / cntA;
+          cAG = sAG / cntA;
+          cAB = sAB / cntA;
+        }
+        if (cntB > 0) {
+          cBR = sBR / cntB;
+          cBG = sBG / cntB;
+          cBB = sBB / cntB;
+        }
+        nA = cntA;
+        nB = cntB;
+      }
+    } else {
+      nA = samples.length;
+      nB = 0;
+    }
+
+    // Secondary tie-breaker: 2px-inset inner ring (avoids outside-card bleed on 0px outer rim)
+    const insetX = Math.min(2, Math.floor((sw - 1) / 2));
+    const insetY = Math.min(2, Math.floor((sh - 1) / 2));
+    let innerA = 0,
+      innerB = 0;
+    for (let cx = insetX; cx < sw - insetX; cx += 2) {
+      for (const cy of [insetY, sh - 1 - insetY]) {
+        const idx = (cy * sw + cx) * 4;
+        const dA =
+          Math.abs(data[idx] - cAR) +
+          Math.abs(data[idx + 1] - cAG) +
+          Math.abs(data[idx + 2] - cAB);
+        const dB =
+          Math.abs(data[idx] - cBR) +
+          Math.abs(data[idx + 1] - cBG) +
+          Math.abs(data[idx + 2] - cBB);
+        if (dA <= dB) innerA++;
+        else innerB++;
       }
     }
 
-    const bgRgb: [number, number, number] = [
-      Math.round(c0R),
-      Math.round(c0G),
-      Math.round(c0B),
-    ];
-    let fgRgb: [number, number, number] = [
-      Math.round(c1R),
-      Math.round(c1G),
-      Math.round(c1B),
-    ];
+    // Typography Area Law: inside a text bounding box, background area ALWAYS exceeds character stroke area (~70-85% vs 15-30%)!
+    const fracInteriorA = nA / Math.max(1, nA + nB);
+    const fracInnerA = innerA + innerB > 0 ? innerA / (innerA + innerB) : fracInteriorA;
+    const aIsBackground = fracInteriorA * 0.76 + fracInnerA * 0.24 >= 0.5;
 
+    const bgRgb: [number, number, number] = aIsBackground
+      ? [Math.round(cAR), Math.round(cAG), Math.round(cAB)]
+      : [Math.round(cBR), Math.round(cBG), Math.round(cBB)];
+    let fgRgb: [number, number, number] = aIsBackground
+      ? [Math.round(cBR), Math.round(cBG), Math.round(cBB)]
+      : [Math.round(cAR), Math.round(cAG), Math.round(cAB)];
+
+    const bgLum = 0.299 * bgRgb[0] + 0.587 * bgRgb[1] + 0.114 * bgRgb[2];
     const sep =
       Math.abs(fgRgb[0] - bgRgb[0]) +
       Math.abs(fgRgb[1] - bgRgb[1]) +
       Math.abs(fgRgb[2] - bgRgb[2]);
     if (sep < 55) {
-      const lum = 0.299 * bgRgb[0] + 0.587 * bgRgb[1] + 0.114 * bgRgb[2];
-      fgRgb = lum < 135 ? [255, 255, 255] : [15, 23, 42];
+      fgRgb = bgLum < 135 ? [255, 255, 255] : [15, 23, 42];
+    } else {
+      // Snap near-white text on dark cards to crisp pure #ffffff even if fireworks slightly tinted a few pixels
+      const fgLum = 0.299 * fgRgb[0] + 0.587 * fgRgb[1] + 0.114 * fgRgb[2];
+      const fgSat = Math.max(fgRgb[0], fgRgb[1], fgRgb[2]) - Math.min(fgRgb[0], fgRgb[1], fgRgb[2]);
+      if (bgLum < 95 && fgLum > 188 && fgSat < 55) {
+        fgRgb = [255, 255, 255];
+      }
     }
 
     return {
@@ -1323,11 +1371,11 @@ function inpaintTextStrokesInBox(
   const coreH = Math.min(ch - coreY, Math.ceil(height * scaleY));
   if (coreW < 4 || coreH < 4) return;
 
-  // Shared Onion-Peel + Laplace diffusion helper is called below after building a safe stroke mask.
-  // Extra top/bottom pad captures Vietnamese diacritics (Ễ, Ộ, Ố, Ắ) & descenders WITHOUT crossing blank gaps into neighboring elements (e.g. gold 16:00 timestamps)
-  const padTop = Math.min(coreY, Math.max(4, Math.round(coreH * 0.22)));
-  const padBot = Math.min(ch - (coreY + coreH), Math.max(3, Math.round(coreH * 0.14)));
-  const padX = Math.min(coreX, Math.max(4, Math.round(coreH * 0.12)));
+  // Generous scan headroom to catch Vietnamese stacked diacritics OR lines slightly outside Gemini's ymin/ymax,
+  // paired with a strict 2-blank-row stopper + container border guard so neighboring timestamps/borders are 100% untouched!
+  const padTop = Math.min(coreY, Math.max(8, Math.round(coreH * 0.36)));
+  const padBot = Math.min(ch - (coreY + coreH), Math.max(6, Math.round(coreH * 0.28)));
+  const padX = Math.min(coreX, Math.max(4, Math.round(coreH * 0.14)));
 
   const px0 = Math.max(0, coreX - padX);
   const py0 = Math.max(0, coreY - padTop);
@@ -1347,55 +1395,106 @@ function inpaintTextStrokesInBox(
     Math.abs(fgRgb[0] - bgRgb[0]) +
     Math.abs(fgRgb[1] - bgRgb[1]) +
     Math.abs(fgRgb[2] - bgRgb[2]);
-  const minBgDiff = Math.max(26, sep * 0.2);
-  const maxOuterInkDiff = Math.max(58, sep * 0.42);
-  const chTol = 48;
+  const maxOuterInkDiff = Math.max(64, sep * 0.42);
+  const chTol = 54;
 
-  const relCoreY0 = coreY - py0;
-  const relCoreY1 = relCoreY0 + coreH;
-  const relCoreX0 = coreX - px0;
-  const relCoreX1 = relCoreX0 + coreW;
+  // RGB vector from bgRgb -> fgRgb for collinear stroke + anti-alias halo detection
+  // (Prevents erasing colorful fireworks, champagne glasses, pocket watches, or gold rims inside the box!)
+  const vr = fgRgb[0] - bgRgb[0];
+  const vg = fgRgb[1] - bgRgb[1];
+  const vb = fgRgb[2] - bgRgb[2];
+  const vLenSq = Math.max(1, vr * vr + vg * vg + vb * vb);
 
-  // 1) Mark strokes inside the core bounding box
-  for (let ry = Math.max(1, relCoreY0); ry < Math.min(ph - 1, relCoreY1); ry++) {
-    for (let rx = Math.max(1, relCoreX0); rx < Math.min(pw - 1, relCoreX1); rx++) {
-      const idx = (ry * pw + rx) * 4;
-      const r = srcData[idx];
-      const g = srcData[idx + 1];
-      const b = srcData[idx + 2];
-      const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
-      const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
-      if (dFg < dBg * 1.24 || dBg >= minBgDiff) {
-        mask[ry * pw + rx] = 1;
-      }
-    }
-  }
-
-  // 2) Scan UPWARD from core top edge for stacked diacritics, stopping immediately at 2 blank rows
-  //    so neighboring elements across a blank gap (like gold 16:00 / 17:00 / 19:00 / 21:30) are 100% untouched!
-  let minSafeDilateY = Math.max(1, relCoreY0 - 1);
-  let blankStreakTop = 0;
-  for (let ry = relCoreY0 - 1; ry >= 1; ry--) {
-    let rowMarked = 0;
-    for (let rx = Math.max(1, relCoreX0); rx < Math.min(pw - 1, relCoreX1); rx++) {
-      const idx = (ry * pw + rx) * 4;
-      const r = srcData[idx];
-      const g = srcData[idx + 1];
-      const b = srcData[idx + 2];
-      const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
-      const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
-      if (
+  const isInkStrokePixel = (r: number, g: number, b: number, strictOuter: boolean): boolean => {
+    const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
+    const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
+    if (strictOuter) {
+      return (
         Math.abs(r - fgRgb[0]) <= chTol &&
         Math.abs(g - fgRgb[1]) <= chTol &&
         Math.abs(b - fgRgb[2]) <= chTol &&
         dFg <= maxOuterInkDiff &&
-        dFg < dBg * 0.72
-      ) {
+        dFg < dBg * 0.78
+      );
+    }
+    const t = ((r - bgRgb[0]) * vr + (g - bgRgb[1]) * vg + (b - bgRgb[2]) * vb) / vLenSq;
+    const tc = Math.max(0, Math.min(1.15, t));
+    const dr = r - (bgRgb[0] + tc * vr);
+    const dg = g - (bgRgb[1] + tc * vg);
+    const db = b - (bgRgb[2] + tc * vb);
+    const dPerpSq = dr * dr + dg * dg + db * db;
+    // Matches either linear bg<->fg blend (anti-aliased letter edges, dPerp <= 52) OR direct ink proximity (letters over fireworks)
+    return (t >= 0.18 && dPerpSq <= 52 * 52) || (dFg <= Math.max(76, sep * 0.34) && dFg < dBg * 0.88);
+  };
+
+  let effCoreY0 = Math.max(1, coreY - py0);
+  let effCoreY1 = Math.min(ph - 1, effCoreY0 + coreH);
+  const relCoreX0 = Math.max(1, coreX - px0);
+  const relCoreX1 = Math.min(pw - 1, relCoreX0 + coreW);
+  const effCoreW = Math.max(1, relCoreX1 - relCoreX0);
+
+  // 0) Container Border Trimming: if Gemini's box grazed a card's top/bottom border or outer poster margin
+  //    (where >60% of the row is non-background, e.g. gold rim or cream margin below 31/12/2026), step inward!
+  const rowNonBgThresh = Math.max(52, sep * 0.32);
+  while (effCoreY1 - effCoreY0 > 6) {
+    let nonBgCnt = 0;
+    const ry = effCoreY1 - 1;
+    for (let rx = relCoreX0; rx < relCoreX1; rx++) {
+      const idx = (ry * pw + rx) * 4;
+      const dBg =
+        Math.abs(srcData[idx] - bgRgb[0]) +
+        Math.abs(srcData[idx + 1] - bgRgb[1]) +
+        Math.abs(srcData[idx + 2] - bgRgb[2]);
+      if (dBg > rowNonBgThresh) nonBgCnt++;
+    }
+    if (nonBgCnt > effCoreW * 0.6) effCoreY1--;
+    else break;
+  }
+  while (effCoreY1 - effCoreY0 > 6) {
+    let nonBgCnt = 0;
+    const ry = effCoreY0;
+    for (let rx = relCoreX0; rx < relCoreX1; rx++) {
+      const idx = (ry * pw + rx) * 4;
+      const dBg =
+        Math.abs(srcData[idx] - bgRgb[0]) +
+        Math.abs(srcData[idx + 1] - bgRgb[1]) +
+        Math.abs(srcData[idx + 2] - bgRgb[2]);
+      if (dBg > rowNonBgThresh) nonBgCnt++;
+    }
+    if (nonBgCnt > effCoreW * 0.6) effCoreY0++;
+    else break;
+  }
+
+  // 1) Mark true character strokes inside the core bounding box (preserving non-ink graphics & borders)
+  for (let ry = effCoreY0; ry < effCoreY1; ry++) {
+    let rowMarked = 0;
+    for (let rx = relCoreX0; rx < relCoreX1; rx++) {
+      const idx = (ry * pw + rx) * 4;
+      if (isInkStrokePixel(srcData[idx], srcData[idx + 1], srcData[idx + 2], false)) {
         mask[ry * pw + rx] = 1;
         rowMarked++;
       }
     }
-    if (rowMarked > coreW * 0.58) {
+    // Protect solid horizontal underlines / divider bars (>72% width) inside core
+    if (rowMarked > effCoreW * 0.72) {
+      for (let rx = relCoreX0; rx < relCoreX1; rx++) mask[ry * pw + rx] = 0;
+    }
+  }
+
+  // 2) Scan UPWARD from core top edge for stacked diacritics OR slightly-clipped top stems (e.g. "DJ, Dancer &"),
+  //    stopping immediately at 2 blank rows so neighboring timestamps (16:00 / 17:00 / 19:00 / 21:30) are 100% untouched!
+  let minSafeDilateY = Math.max(1, effCoreY0 - 1);
+  let blankStreakTop = 0;
+  for (let ry = effCoreY0 - 1; ry >= 1; ry--) {
+    let rowMarked = 0;
+    for (let rx = relCoreX0; rx < relCoreX1; rx++) {
+      const idx = (ry * pw + rx) * 4;
+      if (isInkStrokePixel(srcData[idx], srcData[idx + 1], srcData[idx + 2], true)) {
+        mask[ry * pw + rx] = 1;
+        rowMarked++;
+      }
+    }
+    if (rowMarked > effCoreW * 0.56) {
       for (let rx = 0; rx < pw; rx++) mask[ry * pw + rx] = 0;
       break;
     }
@@ -1408,30 +1507,25 @@ function inpaintTextStrokesInBox(
     }
   }
 
-  // 3) Scan DOWNWARD from core bottom edge for descenders (g, y, p, ự), also stopping at 2 blank rows
-  let maxSafeDilateY = Math.min(ph - 2, relCoreY1);
+  // 3) Scan DOWNWARD from core bottom edge for descenders (g, y, p, ự), stopping at 2 blank rows or card border
+  let maxSafeDilateY = Math.min(ph - 2, effCoreY1);
   let blankStreakBot = 0;
-  for (let ry = relCoreY1; ry < ph - 1; ry++) {
+  for (let ry = effCoreY1; ry < ph - 1; ry++) {
     let rowMarked = 0;
-    for (let rx = Math.max(1, relCoreX0); rx < Math.min(pw - 1, relCoreX1); rx++) {
+    let nonBgCnt = 0;
+    for (let rx = relCoreX0; rx < relCoreX1; rx++) {
       const idx = (ry * pw + rx) * 4;
       const r = srcData[idx];
       const g = srcData[idx + 1];
       const b = srcData[idx + 2];
       const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
-      const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
-      if (
-        Math.abs(r - fgRgb[0]) <= chTol &&
-        Math.abs(g - fgRgb[1]) <= chTol &&
-        Math.abs(b - fgRgb[2]) <= chTol &&
-        dFg <= maxOuterInkDiff &&
-        dFg < dBg * 0.72
-      ) {
+      if (dBg > rowNonBgThresh) nonBgCnt++;
+      if (isInkStrokePixel(r, g, b, true)) {
         mask[ry * pw + rx] = 1;
         rowMarked++;
       }
     }
-    if (rowMarked > coreW * 0.58) {
+    if (rowMarked > effCoreW * 0.56 || nonBgCnt > effCoreW * 0.58) {
       for (let rx = 0; rx < pw; rx++) mask[ry * pw + rx] = 0;
       break;
     }
@@ -1444,8 +1538,8 @@ function inpaintTextStrokesInBox(
     }
   }
 
-  // 4) Dilate mask by 3px (clamped within safe gap bounds) so anti-aliased letter halos & soft drop-shadows are cleanly erased
-  for (let pass = 0; pass < 3; pass++) {
+  // 4) Dilate mask by 2px (clamped within safe gap bounds)
+  for (let pass = 0; pass < 2; pass++) {
     const dilated = new Uint8Array(mask);
     for (let ry = minSafeDilateY; ry <= maxSafeDilateY; ry++) {
       for (let rx = 1; rx < pw - 1; rx++) {
@@ -1468,13 +1562,15 @@ function inpaintTextStrokesInBox(
     mask.set(dilated);
   }
 
-  inpaintMaskPatch(out, pw, ph, mask, bgRgb, 14);
+  // Edge-guarded diffusion with guardRgb = bgRgb prevents outside-card cream/gold colors from EVER bleeding inward!
+  inpaintMaskPatch(out, pw, ph, mask, bgRgb, 12, bgRgb, Math.max(115, sep * 0.45));
   targetCtx.putImageData(outImg, px0, py0);
 }
 
 /**
- * Shared Onion-Peel + Laplace Harmonic Diffusion inpainter on an RGBA pixel patch.
- * Seamlessly reconstructs gradients, paper textures, dark cards, or festive backgrounds across masked pixels (`mask[p] === 1`).
+ * Shared Onion-Peel + Edge-Guarded Laplace Harmonic Diffusion inpainter on an RGBA pixel patch.
+ * When `guardRgb` is supplied, unmasked boundary pixels that belong to a completely different region
+ * (e.g. bright cream poster margin outside a dark navy card) are rejected so colors NEVER bleed across borders!
  */
 function inpaintMaskPatch(
   out: Uint8ClampedArray,
@@ -1482,7 +1578,9 @@ function inpaintMaskPatch(
   ph: number,
   mask: Uint8Array,
   fallbackRgb: [number, number, number] = [255, 255, 255],
-  smoothPasses: number = 14
+  smoothPasses: number = 14,
+  guardRgb?: [number, number, number],
+  guardTol: number = 135
 ): void {
   const origMask = new Uint8Array(mask);
   const dirs = [
@@ -1525,21 +1623,39 @@ function inpaintMaskPatch(
         gSum = 0,
         bSum = 0,
         wSum = 0;
-      for (const [dx, dy, w] of dirs) {
+      for (const [dx, dy, baseW] of dirs) {
         const np = (ry + dy) * pw + (rx + dx);
         if (mask[np] === 0) {
           const nIdx = np * 4;
-          rSum += out[nIdx] * w;
-          gSum += out[nIdx + 1] * w;
-          bSum += out[nIdx + 2] * w;
+          const nr = out[nIdx];
+          const ng = out[nIdx + 1];
+          const nb = out[nIdx + 2];
+          let w: number = baseW;
+          if (guardRgb) {
+            const dGuard =
+              Math.abs(nr - guardRgb[0]) +
+              Math.abs(ng - guardRgb[1]) +
+              Math.abs(nb - guardRgb[2]);
+            if (dGuard > guardTol) {
+              w = 0.005;
+            }
+          }
+          rSum += nr * w;
+          gSum += ng * w;
+          bSum += nb * w;
           wSum += w;
         }
       }
-      if (wSum > 0) {
-        const pIdx = p * 4;
+      const pIdx = p * 4;
+      if (wSum >= 0.05) {
         out[pIdx] = Math.round(rSum / wSum);
         out[pIdx + 1] = Math.round(gSum / wSum);
         out[pIdx + 2] = Math.round(bSum / wSum);
+        out[pIdx + 3] = 255;
+      } else {
+        out[pIdx] = fallbackRgb[0];
+        out[pIdx + 1] = fallbackRgb[1];
+        out[pIdx + 2] = fallbackRgb[2];
         out[pIdx + 3] = 255;
       }
     }
@@ -1559,23 +1675,79 @@ function inpaintMaskPatch(
   }
 
   const temp = new Uint8ClampedArray(out);
+  const nbrOffsets = [-1, 1, -pw, pw];
   for (let it = 0; it < smoothPasses; it++) {
     for (let ry = 1; ry < ph - 1; ry++) {
       for (let rx = 1; rx < pw - 1; rx++) {
         const p = ry * pw + rx;
         if (!origMask[p]) continue;
         const pIdx = p * 4;
-        const lIdx = (p - 1) * 4;
-        const rIdx = (p + 1) * 4;
-        const uIdx = (p - pw) * 4;
-        const dIdx = (p + pw) * 4;
-        temp[pIdx] = (out[lIdx] + out[rIdx] + out[uIdx] + out[dIdx]) >> 2;
-        temp[pIdx + 1] = (out[lIdx + 1] + out[rIdx + 1] + out[uIdx + 1] + out[dIdx + 1]) >> 2;
-        temp[pIdx + 2] = (out[lIdx + 2] + out[rIdx + 2] + out[uIdx + 2] + out[dIdx + 2]) >> 2;
+        let rs = 0,
+          gs = 0,
+          bs = 0,
+          cnt = 0;
+        for (const off of nbrOffsets) {
+          const np = p + off;
+          const nIdx = np * 4;
+          if (!origMask[np] && guardRgb) {
+            const dGuard =
+              Math.abs(out[nIdx] - guardRgb[0]) +
+              Math.abs(out[nIdx + 1] - guardRgb[1]) +
+              Math.abs(out[nIdx + 2] - guardRgb[2]);
+            if (dGuard > guardTol) continue;
+          }
+          rs += out[nIdx];
+          gs += out[nIdx + 1];
+          bs += out[nIdx + 2];
+          cnt++;
+        }
+        if (cnt > 0) {
+          temp[pIdx] = Math.round(rs / cnt);
+          temp[pIdx + 1] = Math.round(gs / cnt);
+          temp[pIdx + 2] = Math.round(bs / cnt);
+        }
       }
     }
     out.set(temp);
   }
+}
+
+/**
+ * Helper to compute the dominant median color of the immediate unmasked ring around an eraser mask
+ * so Magic Eraser never pulls outside-card colors across a sharp container border!
+ */
+function sampleMaskRingDominantRgb(
+  out: Uint8ClampedArray,
+  pw: number,
+  ph: number,
+  mask: Uint8Array
+): [number, number, number] {
+  const rs: number[] = [];
+  const gs: number[] = [];
+  const bs: number[] = [];
+  for (let ry = 1; ry < ph - 1; ry++) {
+    for (let rx = 1; rx < pw - 1; rx++) {
+      const p = ry * pw + rx;
+      if (mask[p] !== 0) continue;
+      if (
+        mask[p - 1] === 1 ||
+        mask[p + 1] === 1 ||
+        mask[p - pw] === 1 ||
+        mask[p + pw] === 1
+      ) {
+        const idx = p * 4;
+        rs.push(out[idx]);
+        gs.push(out[idx + 1]);
+        bs.push(out[idx + 2]);
+      }
+    }
+  }
+  if (rs.length === 0) return [255, 255, 255];
+  rs.sort((a, b) => a - b);
+  gs.sort((a, b) => a - b);
+  bs.sort((a, b) => a - b);
+  const mid = Math.floor(rs.length / 2);
+  return [rs[mid], gs[mid], bs[mid]];
 }
 
 /**
@@ -1622,23 +1794,24 @@ export async function buildVisionOcrTextBlocks(
         const ymax = Math.max(ymin + 8, Math.min(1000, Number(box.ymax) || ymin + 24));
         const xmax = Math.max(xmin + 16, Math.min(1000, Number(box.xmax) || xmin + 80));
 
-        const x = Math.max(2, Math.round((xmin / 1000) * page.width) - 2);
-        const y = Math.max(2, Math.round((ymin / 1000) * page.height) - 1);
-        const width = Math.min(
-          page.width - x - 2,
-          Math.max(28, Math.round(((xmax - xmin) / 1000) * page.width) + 4)
+        // Tight unpadded crop for exact color separation & stroke inpainting (never crosses card rims!)
+        const rawX = Math.max(1, Math.round((xmin / 1000) * page.width));
+        const rawY = Math.max(1, Math.round((ymin / 1000) * page.height));
+        const rawW = Math.min(
+          page.width - rawX - 1,
+          Math.max(18, Math.round(((xmax - xmin) / 1000) * page.width))
         );
-        const height = Math.min(
-          page.height - y - 2,
-          Math.max(14, Math.round(((ymax - ymin) / 1000) * page.height) + 3)
+        const rawH = Math.min(
+          page.height - rawY - 1,
+          Math.max(12, Math.round(((ymax - ymin) / 1000) * page.height))
         );
 
         const { bgRgb, fgRgb, bgHex, fgHex } = separateBgAndInkColors(
           srcCtx,
-          x,
-          y,
-          width,
-          height,
+          rawX,
+          rawY,
+          rawW,
+          rawH,
           scaleX,
           scaleY
         );
@@ -1646,24 +1819,29 @@ export async function buildVisionOcrTextBlocks(
         inpaintTextStrokesInBox(
           srcCtx,
           cleanCtx,
-          x,
-          y,
-          width,
-          height,
+          rawX,
+          rawY,
+          rawW,
+          rawH,
           scaleX,
           scaleY,
           bgRgb,
           fgRgb
         );
 
+        const x = Math.max(2, rawX - 2);
+        const y = Math.max(2, rawY - 1);
+        const width = Math.min(page.width - x - 2, Math.max(28, rawW + 4));
+        const height = Math.min(page.height - y - 2, Math.max(14, rawH + 2));
+
         const lineCount = Math.max(
           1,
           origTxt.split(/\r?\n/).length,
-          Math.round(origTxt.length / Math.max(10, width / 7))
+          Math.round(origTxt.length / Math.max(11, rawW / 6.8))
         );
         const estimatedFontSize = Math.max(
           7.5,
-          Math.min(36, Number(((height / lineCount) * 0.68).toFixed(1)))
+          Math.min(36, Number(((rawH / lineCount) * 0.7).toFixed(1)))
         );
 
         const rawAlign = String(box.align || '').toLowerCase();
@@ -1677,10 +1855,10 @@ export async function buildVisionOcrTextBlocks(
           y,
           width,
           height,
-          origX: x,
-          origY: y,
-          origWidth: width,
-          origHeight: height,
+          origX: rawX,
+          origY: rawY,
+          origWidth: rawW,
+          origHeight: rawH,
           originalText: origTxt,
           translatedText: transTxt,
           fontSize: estimatedFontSize,
@@ -1699,6 +1877,23 @@ export async function buildVisionOcrTextBlocks(
           isTranslated: true,
         });
       });
+
+      // Harmonize originalFontSize across sibling caption blocks in the same horizontal row
+      // (e.g. 1-line "Múa cổ trang" next to 2-line "Thưởng trà & show\nnhạc cụ dân tộc")
+      for (let i = 0; i < blocks.length; i++) {
+        const siblings = blocks.filter(
+          (b) =>
+            Math.abs(b.y - blocks[i].y) <= 12 &&
+            b.color === blocks[i].color &&
+            Math.abs(b.originalFontSize - blocks[i].originalFontSize) <= 4.5
+        );
+        if (siblings.length >= 2) {
+          const sizes = siblings.map((s) => s.originalFontSize).sort((a, b) => a - b);
+          const medSize = sizes[Math.floor(sizes.length / 2)];
+          blocks[i].originalFontSize = medSize;
+          blocks[i].fontSize = medSize;
+        }
+      }
 
       resolve({
         blocks,
@@ -1890,25 +2085,8 @@ export async function eraseBrushStrokeOnPage(
         }
       }
 
-      // Compute average border fallback RGB from patch perimeter
-      let rSum = 0,
-        gSum = 0,
-        bSum = 0,
-        cnt = 0;
-      for (let rx = 0; rx < pw; rx += 2) {
-        const topIdx = rx * 4;
-        const botIdx = ((ph - 1) * pw + rx) * 4;
-        rSum += out[topIdx] + out[botIdx];
-        gSum += out[topIdx + 1] + out[botIdx + 1];
-        bSum += out[topIdx + 2] + out[botIdx + 2];
-        cnt += 2;
-      }
-      const fallbackRgb: [number, number, number] =
-        cnt > 0
-          ? [Math.round(rSum / cnt), Math.round(gSum / cnt), Math.round(bSum / cnt)]
-          : [255, 255, 255];
-
-      inpaintMaskPatch(out, pw, ph, mask, fallbackRgb, 16);
+      const ringRgb = sampleMaskRingDominantRgb(out, pw, ph, mask);
+      inpaintMaskPatch(out, pw, ph, mask, ringRgb, 14, ringRgb, 145);
       ctx.putImageData(outImg, px0, py0);
       resolve(canvas.toDataURL('image/png'));
     };
@@ -1977,24 +2155,8 @@ export async function eraseRectRegionOnPage(
         }
       }
 
-      let rSum = 0,
-        gSum = 0,
-        bSum = 0,
-        cnt = 0;
-      for (let rx = 0; rx < pw; rx += 2) {
-        const topIdx = rx * 4;
-        const botIdx = ((ph - 1) * pw + rx) * 4;
-        rSum += out[topIdx] + out[botIdx];
-        gSum += out[topIdx + 1] + out[botIdx + 1];
-        bSum += out[topIdx + 2] + out[botIdx + 2];
-        cnt += 2;
-      }
-      const fallbackRgb: [number, number, number] =
-        cnt > 0
-          ? [Math.round(rSum / cnt), Math.round(gSum / cnt), Math.round(bSum / cnt)]
-          : [255, 255, 255];
-
-      inpaintMaskPatch(out, pw, ph, mask, fallbackRgb, 18);
+      const ringRgb = sampleMaskRingDominantRgb(out, pw, ph, mask);
+      inpaintMaskPatch(out, pw, ph, mask, ringRgb, 16, ringRgb, 145);
       ctx.putImageData(outImg, px0, py0);
       resolve(canvas.toDataURL('image/png'));
     };

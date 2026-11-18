@@ -382,6 +382,41 @@ export function autoAlignAndFitPage(
     }
   }
 
+  // 1b. Symmetrically widen narrow centered captions (e.g. "Múa cổ trang" -> "Ancient costume dance")
+  //     into free left/right space on the same row so they don't shrink to tiny font sizes!
+  for (let i = 0; i < updated.length; i++) {
+    const curr = updated[i];
+    if (curr.textAlign !== 'center' || curr.bgOpacity > 0) continue;
+    const text = curr.translatedText || curr.originalText;
+    if (text.length <= curr.originalText.length * 1.1) continue;
+
+    const centerX = curr.x + curr.width / 2;
+    let minSafeLeft = 6;
+    let maxSafeRight = pageWidth - 6;
+
+    for (let j = 0; j < updated.length; j++) {
+      if (i === j) continue;
+      const other = updated[j];
+      const vertOverlap =
+        Math.min(curr.y + curr.height + 10, other.y + other.height) -
+        Math.max(curr.y - 4, other.y);
+      if (vertOverlap > 2) {
+        if (other.x + other.width <= centerX) {
+          minSafeLeft = Math.max(minSafeLeft, other.x + other.width + 6);
+        } else if (other.x >= centerX) {
+          maxSafeRight = Math.min(maxSafeRight, other.x - 6);
+        }
+      }
+    }
+
+    const maxHalfW = Math.min(centerX - minSafeLeft, maxSafeRight - centerX);
+    const desiredW = Math.min(curr.width * 1.48, maxHalfW * 2);
+    if (desiredW > curr.width + 4) {
+      curr.width = Math.round(desiredW);
+      curr.x = Math.round(centerX - curr.width / 2);
+    }
+  }
+
   // 2. Sort top-to-bottom and calculate maximum safe height before hitting the next block in the same column
   const sortedByY = [...updated].sort((a, b) => a.y - b.y);
   for (let i = 0; i < sortedByY.length; i++) {
