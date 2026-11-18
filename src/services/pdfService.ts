@@ -1035,9 +1035,10 @@ export async function renderCompositePageCanvas(
     if (!text.trim()) continue;
 
     ctx.save();
-    // Strict clip to tb bounding box so no character can ever bleed outside the box
+    // Clip to tb bounding box (relaxed vertically when background is transparent so multi-line descenders never clip)
+    const extraClipH = tb.bgOpacity === 0 ? Math.max(14, tb.fontSize * 1.45) : 4;
     ctx.beginPath();
-    ctx.rect(tb.x, tb.y, tb.width, tb.height + 4);
+    ctx.rect(tb.x - 2, tb.y - 1, tb.width + 4, tb.height + extraClipH);
     ctx.clip();
 
     if (tb.bgOpacity > 0) {
@@ -1058,7 +1059,7 @@ export async function renderCompositePageCanvas(
 
     lines.forEach((line, idx) => {
       const ly = tb.y + pad + idx * lineStep;
-      if (ly + tb.fontSize * 0.75 > tb.y + tb.height + 4) return;
+      if (ly + tb.fontSize * 0.75 > tb.y + tb.height + extraClipH) return;
 
       let lx = tb.x + pad;
       if (tb.textAlign === 'center') {
@@ -1322,10 +1323,11 @@ function inpaintTextStrokesInBox(
   const coreH = Math.min(ch - coreY, Math.ceil(height * scaleY));
   if (coreW < 4 || coreH < 4) return;
 
-  // Extra top/bottom pad captures tall Vietnamese diacritics (Ễ, Ộ, Ố, Ắ) & descenders (g, y, p, ự)
-  const padTop = Math.min(coreY, Math.max(6, Math.round(coreH * 0.34)));
-  const padBot = Math.min(ch - (coreY + coreH), Math.max(4, Math.round(coreH * 0.2)));
-  const padX = Math.min(coreX, Math.max(4, Math.round(coreH * 0.14)));
+  // Shared Onion-Peel + Laplace diffusion helper is called below after building a safe stroke mask.
+  // Extra top/bottom pad captures Vietnamese diacritics (Ễ, Ộ, Ố, Ắ) & descenders WITHOUT crossing blank gaps into neighboring elements (e.g. gold 16:00 timestamps)
+  const padTop = Math.min(coreY, Math.max(4, Math.round(coreH * 0.22)));
+  const padBot = Math.min(ch - (coreY + coreH), Math.max(3, Math.round(coreH * 0.14)));
+  const padX = Math.min(coreX, Math.max(4, Math.round(coreH * 0.12)));
 
   const px0 = Math.max(0, coreX - padX);
   const py0 = Math.max(0, coreY - padTop);
@@ -1339,60 +1341,113 @@ function inpaintTextStrokesInBox(
   const outImg = targetCtx.getImageData(px0, py0, pw, ph);
   const out = outImg.data;
 
-  // mask: 0 = untouched background, 1 = ink stroke to fill, 2 = newly filled pixel
+  // mask: 0 = untouched background, 1 = ink stroke to fill
   const mask = new Uint8Array(pw * ph);
-  const origMask = new Uint8Array(pw * ph);
   const sep =
     Math.abs(fgRgb[0] - bgRgb[0]) +
     Math.abs(fgRgb[1] - bgRgb[1]) +
     Math.abs(fgRgb[2] - bgRgb[2]);
-  const minBgDiff = Math.max(28, sep * 0.22);
-  const maxOuterInkDiff = Math.max(68, sep * 0.48);
+  const minBgDiff = Math.max(26, sep * 0.2);
+  const maxOuterInkDiff = Math.max(58, sep * 0.42);
+  const chTol = 48;
 
   const relCoreY0 = coreY - py0;
   const relCoreY1 = relCoreY0 + coreH;
   const relCoreX0 = coreX - px0;
   const relCoreX1 = relCoreX0 + coreW;
 
-  for (let ry = 0; ry < ph; ry++) {
-    const inCoreY = ry >= relCoreY0 && ry < relCoreY1;
-    let rowMarked = 0;
-    for (let rx = 0; rx < pw; rx++) {
-      // Always keep the outermost 1px boundary unmasked as diffusion anchor
-      if (rx === 0 || ry === 0 || rx === pw - 1 || ry === ph - 1) continue;
-      const inCoreX = rx >= relCoreX0 && rx < relCoreX1;
+  // 1) Mark strokes inside the core bounding box
+  for (let ry = Math.max(1, relCoreY0); ry < Math.min(ph - 1, relCoreY1); ry++) {
+    for (let rx = Math.max(1, relCoreX0); rx < Math.min(pw - 1, relCoreX1); rx++) {
       const idx = (ry * pw + rx) * 4;
       const r = srcData[idx];
       const g = srcData[idx + 1];
       const b = srcData[idx + 2];
       const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
       const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
-
-      if (inCoreY && inCoreX) {
-        if (dFg < dBg * 1.24 || dBg >= minBgDiff) {
-          mask[ry * pw + rx] = 1;
-          rowMarked++;
-        }
-      } else if (inCoreX) {
-        // Outer top/bottom diacritic band: only mark pixels genuinely matching the letter ink color!
-        if (dFg <= maxOuterInkDiff && dFg < dBg * 0.98) {
-          mask[ry * pw + rx] = 1;
-          rowMarked++;
-        }
-      }
-    }
-    // Protect container/pill horizontal border lines in the outer pad band (borders span >60% width; accents <35%)
-    if (!inCoreY && rowMarked > pw * 0.58) {
-      for (let rx = 0; rx < pw; rx++) {
-        mask[ry * pw + rx] = 0;
+      if (dFg < dBg * 1.24 || dBg >= minBgDiff) {
+        mask[ry * pw + rx] = 1;
       }
     }
   }
 
-  // Dilate mask by 2px (two 3x3 passes) so anti-aliased letter halos & JPEG ringing are 100% erased
-  for (let pass = 0; pass < 2; pass++) {
+  // 2) Scan UPWARD from core top edge for stacked diacritics, stopping immediately at 2 blank rows
+  //    so neighboring elements across a blank gap (like gold 16:00 / 17:00 / 19:00 / 21:30) are 100% untouched!
+  let minSafeDilateY = Math.max(1, relCoreY0 - 1);
+  let blankStreakTop = 0;
+  for (let ry = relCoreY0 - 1; ry >= 1; ry--) {
+    let rowMarked = 0;
+    for (let rx = Math.max(1, relCoreX0); rx < Math.min(pw - 1, relCoreX1); rx++) {
+      const idx = (ry * pw + rx) * 4;
+      const r = srcData[idx];
+      const g = srcData[idx + 1];
+      const b = srcData[idx + 2];
+      const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
+      const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
+      if (
+        Math.abs(r - fgRgb[0]) <= chTol &&
+        Math.abs(g - fgRgb[1]) <= chTol &&
+        Math.abs(b - fgRgb[2]) <= chTol &&
+        dFg <= maxOuterInkDiff &&
+        dFg < dBg * 0.72
+      ) {
+        mask[ry * pw + rx] = 1;
+        rowMarked++;
+      }
+    }
+    if (rowMarked > coreW * 0.58) {
+      for (let rx = 0; rx < pw; rx++) mask[ry * pw + rx] = 0;
+      break;
+    }
+    if (rowMarked === 0) {
+      blankStreakTop++;
+      if (blankStreakTop >= 2) break;
+    } else {
+      blankStreakTop = 0;
+      minSafeDilateY = Math.max(1, ry - 1);
+    }
+  }
+
+  // 3) Scan DOWNWARD from core bottom edge for descenders (g, y, p, ự), also stopping at 2 blank rows
+  let maxSafeDilateY = Math.min(ph - 2, relCoreY1);
+  let blankStreakBot = 0;
+  for (let ry = relCoreY1; ry < ph - 1; ry++) {
+    let rowMarked = 0;
+    for (let rx = Math.max(1, relCoreX0); rx < Math.min(pw - 1, relCoreX1); rx++) {
+      const idx = (ry * pw + rx) * 4;
+      const r = srcData[idx];
+      const g = srcData[idx + 1];
+      const b = srcData[idx + 2];
+      const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
+      const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
+      if (
+        Math.abs(r - fgRgb[0]) <= chTol &&
+        Math.abs(g - fgRgb[1]) <= chTol &&
+        Math.abs(b - fgRgb[2]) <= chTol &&
+        dFg <= maxOuterInkDiff &&
+        dFg < dBg * 0.72
+      ) {
+        mask[ry * pw + rx] = 1;
+        rowMarked++;
+      }
+    }
+    if (rowMarked > coreW * 0.58) {
+      for (let rx = 0; rx < pw; rx++) mask[ry * pw + rx] = 0;
+      break;
+    }
+    if (rowMarked === 0) {
+      blankStreakBot++;
+      if (blankStreakBot >= 2) break;
+    } else {
+      blankStreakBot = 0;
+      maxSafeDilateY = Math.min(ph - 2, ry + 1);
+    }
+  }
+
+  // 4) Dilate mask by 3px (clamped within safe gap bounds) so anti-aliased letter halos & soft drop-shadows are cleanly erased
+  for (let pass = 0; pass < 3; pass++) {
     const dilated = new Uint8Array(mask);
-    for (let ry = 1; ry < ph - 1; ry++) {
+    for (let ry = minSafeDilateY; ry <= maxSafeDilateY; ry++) {
       for (let rx = 1; rx < pw - 1; rx++) {
         const p = ry * pw + rx;
         if (mask[p]) continue;
@@ -1412,9 +1467,24 @@ function inpaintTextStrokesInBox(
     }
     mask.set(dilated);
   }
-  origMask.set(mask);
 
-  // Step 1: Onion-peel inward boundary filling (fills thin strokes from surrounding background in ~6-12 peels)
+  inpaintMaskPatch(out, pw, ph, mask, bgRgb, 14);
+  targetCtx.putImageData(outImg, px0, py0);
+}
+
+/**
+ * Shared Onion-Peel + Laplace Harmonic Diffusion inpainter on an RGBA pixel patch.
+ * Seamlessly reconstructs gradients, paper textures, dark cards, or festive backgrounds across masked pixels (`mask[p] === 1`).
+ */
+function inpaintMaskPatch(
+  out: Uint8ClampedArray,
+  pw: number,
+  ph: number,
+  mask: Uint8Array,
+  fallbackRgb: [number, number, number] = [255, 255, 255],
+  smoothPasses: number = 14
+): void {
+  const origMask = new Uint8Array(mask);
   const dirs = [
     [-1, 0, 1.4],
     [1, 0, 1.4],
@@ -1426,7 +1496,7 @@ function inpaintTextStrokesInBox(
     [1, 1, 1.0],
   ] as const;
 
-  for (let peel = 0; peel < 64; peel++) {
+  for (let peel = 0; peel < 160; peel++) {
     const frontier: number[] = [];
     for (let ry = 1; ry < ph - 1; ry++) {
       for (let rx = 1; rx < pw - 1; rx++) {
@@ -1451,7 +1521,10 @@ function inpaintTextStrokesInBox(
     for (const p of frontier) {
       const ry = Math.floor(p / pw);
       const rx = p - ry * pw;
-      let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
+      let rSum = 0,
+        gSum = 0,
+        bSum = 0,
+        wSum = 0;
       for (const [dx, dy, w] of dirs) {
         const np = (ry + dy) * pw + (rx + dx);
         if (mask[np] === 0) {
@@ -1475,20 +1548,18 @@ function inpaintTextStrokesInBox(
     }
   }
 
-  // Fallback for any isolated interior pixels if entire patch had no unmasked boundary
   for (let p = 0; p < pw * ph; p++) {
     if (mask[p] === 1) {
       const pIdx = p * 4;
-      out[pIdx] = bgRgb[0];
-      out[pIdx + 1] = bgRgb[1];
-      out[pIdx + 2] = bgRgb[2];
+      out[pIdx] = fallbackRgb[0];
+      out[pIdx + 1] = fallbackRgb[1];
+      out[pIdx + 2] = fallbackRgb[2];
       out[pIdx + 3] = 255;
     }
   }
 
-  // Step 2: 10 Laplace harmonic smoothing passes on originally-masked pixels for silky gradient continuity
   const temp = new Uint8ClampedArray(out);
-  for (let it = 0; it < 10; it++) {
+  for (let it = 0; it < smoothPasses; it++) {
     for (let ry = 1; ry < ph - 1; ry++) {
       for (let rx = 1; rx < pw - 1; rx++) {
         const p = ry * pw + rx;
@@ -1505,8 +1576,6 @@ function inpaintTextStrokesInBox(
     }
     out.set(temp);
   }
-
-  targetCtx.putImageData(outImg, px0, py0);
 }
 
 /**
@@ -1710,5 +1779,225 @@ export async function removeTextBackgroundsOnPage(page: PageData): Promise<PageD
       });
     };
     img.src = page.backgroundDataUrl;
+  });
+}
+
+/**
+ * Interactive Magic Eraser (Brush Mode):
+ * Seamlessly erases any user-brushed stroke (remnant shadows, extra text, unwanted icons/decorations)
+ * on `cleanBackgroundDataUrl || backgroundDataUrl` using Onion-Peel + Laplace harmonic diffusion!
+ */
+export async function eraseBrushStrokeOnPage(
+  page: PageData,
+  points: Array<{ x: number; y: number }>,
+  brushRadius: number
+): Promise<string> {
+  const baseSrc = page.cleanBackgroundDataUrl || page.backgroundDataUrl;
+  if (!points || points.length === 0) return baseSrc;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onerror = () => resolve(baseSrc);
+    img.onload = () => {
+      const cw = img.width;
+      const ch = img.height;
+      const canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(baseSrc);
+        return;
+      }
+      ctx.drawImage(img, 0, 0);
+
+      const scaleX = cw / Math.max(1, page.width);
+      const scaleY = ch / Math.max(1, page.height);
+      const rPx = Math.max(3, Math.round(brushRadius * ((scaleX + scaleY) * 0.5)));
+
+      const scaledPts = points.map((pt) => ({
+        x: pt.x * scaleX,
+        y: pt.y * scaleY,
+      }));
+
+      let minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
+      for (const p of scaledPts) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+
+      const anchorPad = Math.max(10, Math.round(rPx * 0.45));
+      const px0 = Math.max(0, Math.floor(minX - rPx - anchorPad));
+      const py0 = Math.max(0, Math.floor(minY - rPx - anchorPad));
+      const px1 = Math.min(cw, Math.ceil(maxX + rPx + anchorPad));
+      const py1 = Math.min(ch, Math.ceil(maxY + rPx + anchorPad));
+      const pw = px1 - px0;
+      const ph = py1 - py0;
+      if (pw < 6 || ph < 6) {
+        resolve(baseSrc);
+        return;
+      }
+
+      const outImg = ctx.getImageData(px0, py0, pw, ph);
+      const out = outImg.data;
+      const mask = new Uint8Array(pw * ph);
+      const rSq = rPx * rPx;
+
+      // Rasterize circles + connecting capsules onto binary mask (keeping 1px outer frame unmasked as diffusion anchor)
+      const stampSegment = (ax: number, ay: number, bx: number, by: number) => {
+        const sx0 = Math.max(1, Math.floor(Math.min(ax, bx) - rPx));
+        const sy0 = Math.max(1, Math.floor(Math.min(ay, by) - rPx));
+        const sx1 = Math.min(pw - 2, Math.ceil(Math.max(ax, bx) + rPx));
+        const sy1 = Math.min(ph - 2, Math.ceil(Math.max(ay, by) + rPx));
+        const abx = bx - ax;
+        const aby = by - ay;
+        const abLenSq = abx * abx + aby * aby;
+
+        for (let ry = sy0; ry <= sy1; ry++) {
+          for (let rx = sx0; rx <= sx1; rx++) {
+            const p = ry * pw + rx;
+            if (mask[p]) continue;
+            let t = 0;
+            if (abLenSq > 0.0001) {
+              t = ((rx - ax) * abx + (ry - ay) * aby) / abLenSq;
+              if (t < 0) t = 0;
+              else if (t > 1) t = 1;
+            }
+            const cx = ax + t * abx;
+            const cy = ay + t * aby;
+            const dx = rx - cx;
+            const dy = ry - cy;
+            if (dx * dx + dy * dy <= rSq) {
+              mask[p] = 1;
+            }
+          }
+        }
+      };
+
+      if (scaledPts.length === 1) {
+        const p0 = scaledPts[0];
+        stampSegment(p0.x - px0, p0.y - py0, p0.x - px0, p0.y - py0);
+      } else {
+        for (let i = 0; i < scaledPts.length - 1; i++) {
+          const a = scaledPts[i];
+          const b = scaledPts[i + 1];
+          stampSegment(a.x - px0, a.y - py0, b.x - px0, b.y - py0);
+        }
+      }
+
+      // Compute average border fallback RGB from patch perimeter
+      let rSum = 0,
+        gSum = 0,
+        bSum = 0,
+        cnt = 0;
+      for (let rx = 0; rx < pw; rx += 2) {
+        const topIdx = rx * 4;
+        const botIdx = ((ph - 1) * pw + rx) * 4;
+        rSum += out[topIdx] + out[botIdx];
+        gSum += out[topIdx + 1] + out[botIdx + 1];
+        bSum += out[topIdx + 2] + out[botIdx + 2];
+        cnt += 2;
+      }
+      const fallbackRgb: [number, number, number] =
+        cnt > 0
+          ? [Math.round(rSum / cnt), Math.round(gSum / cnt), Math.round(bSum / cnt)]
+          : [255, 255, 255];
+
+      inpaintMaskPatch(out, pw, ph, mask, fallbackRgb, 16);
+      ctx.putImageData(outImg, px0, py0);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.src = baseSrc;
+  });
+}
+
+/**
+ * Interactive Magic Eraser (Rectangle Box Mode):
+ * Seamlessly erases any user-dragged rectangular region into the surrounding background gradient/texture!
+ */
+export async function eraseRectRegionOnPage(
+  page: PageData,
+  rect: { x: number; y: number; width: number; height: number }
+): Promise<string> {
+  const baseSrc = page.cleanBackgroundDataUrl || page.backgroundDataUrl;
+  if (rect.width < 3 || rect.height < 3) return baseSrc;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onerror = () => resolve(baseSrc);
+    img.onload = () => {
+      const cw = img.width;
+      const ch = img.height;
+      const canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(baseSrc);
+        return;
+      }
+      ctx.drawImage(img, 0, 0);
+
+      const scaleX = cw / Math.max(1, page.width);
+      const scaleY = ch / Math.max(1, page.height);
+      const rx0 = Math.max(0, Math.floor(rect.x * scaleX));
+      const ry0 = Math.max(0, Math.floor(rect.y * scaleY));
+      const rx1 = Math.min(cw, Math.ceil((rect.x + rect.width) * scaleX));
+      const ry1 = Math.min(ch, Math.ceil((rect.y + rect.height) * scaleY));
+
+      const anchorPad = 10;
+      const px0 = Math.max(0, rx0 - anchorPad);
+      const py0 = Math.max(0, ry0 - anchorPad);
+      const px1 = Math.min(cw, rx1 + anchorPad);
+      const py1 = Math.min(ch, ry1 + anchorPad);
+      const pw = px1 - px0;
+      const ph = py1 - py0;
+      if (pw < 6 || ph < 6) {
+        resolve(baseSrc);
+        return;
+      }
+
+      const outImg = ctx.getImageData(px0, py0, pw, ph);
+      const out = outImg.data;
+      const mask = new Uint8Array(pw * ph);
+
+      const mx0 = Math.max(1, rx0 - px0);
+      const my0 = Math.max(1, ry0 - py0);
+      const mx1 = Math.min(pw - 1, rx1 - px0);
+      const my1 = Math.min(ph - 1, ry1 - py0);
+
+      for (let ry = my0; ry < my1; ry++) {
+        for (let rx = mx0; rx < mx1; rx++) {
+          mask[ry * pw + rx] = 1;
+        }
+      }
+
+      let rSum = 0,
+        gSum = 0,
+        bSum = 0,
+        cnt = 0;
+      for (let rx = 0; rx < pw; rx += 2) {
+        const topIdx = rx * 4;
+        const botIdx = ((ph - 1) * pw + rx) * 4;
+        rSum += out[topIdx] + out[botIdx];
+        gSum += out[topIdx + 1] + out[botIdx + 1];
+        bSum += out[topIdx + 2] + out[botIdx + 2];
+        cnt += 2;
+      }
+      const fallbackRgb: [number, number, number] =
+        cnt > 0
+          ? [Math.round(rSum / cnt), Math.round(gSum / cnt), Math.round(bSum / cnt)]
+          : [255, 255, 255];
+
+      inpaintMaskPatch(out, pw, ph, mask, fallbackRgb, 18);
+      ctx.putImageData(outImg, px0, py0);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.src = baseSrc;
   });
 }

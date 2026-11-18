@@ -71,7 +71,12 @@ export type TranslationEngine =
 
 export type ViewMode = 'translated' | 'split' | 'original';
 
-export type ActiveTool = 'select' | 'snip-image' | 'add-text';
+export type ActiveTool =
+  | 'select'
+  | 'snip-image'
+  | 'add-text'
+  | 'eraser-brush'
+  | 'eraser-box';
 
 export interface LanguageOption {
   code: string;

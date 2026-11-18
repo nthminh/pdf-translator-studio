@@ -13,6 +13,8 @@ import {
   parseImageFile,
   buildVisionOcrTextBlocks,
   removeTextBackgroundsOnPage,
+  eraseBrushStrokeOnPage,
+  eraseRectRegionOnPage,
   createSampleDocumentPages,
   snipImageRegionFromPage,
   exportPagesToPdf,
@@ -71,6 +73,10 @@ export const App: React.FC = () => {
   const [zoom, setZoom] = useState<number>(1.05);
   const [viewMode, setViewMode] = useState<ViewMode>('translated');
   const [activeTool, setActiveTool] = useState<ActiveTool>('select');
+  const [eraserBrushSize, setEraserBrushSize] = useState<number>(14);
+  const [eraserUndoStack, setEraserUndoStack] = useState<
+    Array<{ pageIdx: number; prevCleanBg?: string }>
+  >([]);
   const [showBoundingBoxes, setShowBoundingBoxes] = useState<boolean>(true);
 
   // Status & Progress
@@ -501,6 +507,86 @@ export const App: React.FC = () => {
     setActiveTool('select');
   };
 
+  // Interactive Magic Eraser: Brush Stroke
+  const handleEraseBrushStroke = async (
+    points: Array<{ x: number; y: number }>,
+    radius: number
+  ) => {
+    if (!currentPage || points.length === 0) return;
+    const targetIdx = currentPageIdx;
+    const prevCleanBg = currentPage.cleanBackgroundDataUrl;
+    try {
+      const nextCleanUrl = await eraseBrushStrokeOnPage(currentPage, points, radius);
+      setEraserUndoStack((prev) => [...prev.slice(-24), { pageIdx: targetIdx, prevCleanBg }]);
+      setPages((prev) =>
+        prev.map((p, idx) =>
+          idx === targetIdx ? { ...p, cleanBackgroundDataUrl: nextCleanUrl } : p
+        )
+      );
+      setLastStats('🧽 Đã tẩy sạch chi tiết thừa & tự động hòa trộn màu nền!');
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Interactive Magic Eraser: Rectangle Box
+  const handleEraseRectRegion = async (rect: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }) => {
+    if (!currentPage) return;
+    const targetIdx = currentPageIdx;
+    const prevCleanBg = currentPage.cleanBackgroundDataUrl;
+    try {
+      const nextCleanUrl = await eraseRectRegionOnPage(currentPage, rect);
+      setEraserUndoStack((prev) => [...prev.slice(-24), { pageIdx: targetIdx, prevCleanBg }]);
+      setPages((prev) =>
+        prev.map((p, idx) =>
+          idx === targetIdx ? { ...p, cleanBackgroundDataUrl: nextCleanUrl } : p
+        )
+      );
+      setLastStats('🧽 Đã xóa sạch vùng khoanh chọn & tự động hòa trộn màu nền!');
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Undo last Magic Eraser stroke / box
+  const handleUndoErase = () => {
+    setEraserUndoStack((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setPages((pgs) =>
+        pgs.map((p, idx) =>
+          idx === last.pageIdx ? { ...p, cleanBackgroundDataUrl: last.prevCleanBg } : p
+        )
+      );
+      setLastStats('↩️ Đã hoàn tác thao tác tẩy vừa rồi.');
+      return prev.slice(0, -1);
+    });
+  };
+
+  // Global keyboard shortcuts: ESC to exit active tool, Ctrl+Z / Cmd+Z to Undo Eraser
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+      if (e.key === 'Escape' && activeTool !== 'select') {
+        setActiveTool('select');
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        if (eraserUndoStack.length > 0) {
+          e.preventDefault();
+          handleUndoErase();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [activeTool, eraserUndoStack.length]);
+
   // Upload a new image onto the current page
   const handleUploadNewImage = (file: File) => {
     if (!currentPage) return;
@@ -833,6 +919,25 @@ export const App: React.FC = () => {
             Thêm Khung Chữ
           </button>
 
+          <button
+            onClick={() =>
+              setActiveTool(
+                activeTool === 'eraser-brush' || activeTool === 'eraser-box'
+                  ? 'select'
+                  : 'eraser-brush'
+              )
+            }
+            className={`px-2.5 py-1 rounded-lg flex items-center gap-1.5 font-medium transition ${
+              activeTool === 'eraser-brush' || activeTool === 'eraser-box'
+                ? 'bg-rose-600 text-white shadow ring-1 ring-rose-400'
+                : 'bg-rose-500/15 text-rose-300 hover:bg-rose-500/25 border border-rose-500/35'
+            }`}
+            title="Cục tẩy thông minh: Bôi cọ hoặc khoanh vùng để xóa bất kỳ vết bóng mờ, chữ thừa, logo hay chi tiết thừa nào và tự động bù nền mượt mà"
+          >
+            <Eraser className="w-3.5 h-3.5" />
+            🧽 Cục Tẩy
+          </button>
+
           <div className="h-4 w-px bg-slate-800 mx-1" />
 
           <button
@@ -952,20 +1057,93 @@ export const App: React.FC = () => {
         </div>
       </div>
 
-      {/* Contextual Banner when Snip Image or Add Text tool is active */}
+      {/* Contextual Banner when Snip Image, Add Text, or Magic Eraser tool is active */}
       {activeTool !== 'select' && (
-        <div className="bg-emerald-950/90 border-b border-emerald-500/40 px-4 py-1.5 text-center text-xs text-emerald-200 flex items-center justify-center gap-3 z-20">
-          <span>
-            {activeTool === 'snip-image'
-              ? '✂️ Chế độ Cắt/Chọn Vùng Ảnh: Nhấn giữ chuột và kéo khung bao quanh bất kỳ hình ảnh/biểu đồ nào trên trang PDF để tách thành đối tượng ảnh có thể di chuyển & phóng to/thu nhỏ.'
-              : '📝 Chế độ Thêm Khung Chữ: Nhấn giữ chuột và kéo trên trang PDF để tạo khung văn bản mới.'}
-          </span>
-          <button
-            onClick={() => setActiveTool('select')}
-            className="px-2 py-0.5 rounded bg-emerald-800 hover:bg-emerald-700 text-white text-[11px]"
-          >
-            Hủy (ESC)
-          </button>
+        <div
+          className={`${
+            activeTool === 'eraser-brush' || activeTool === 'eraser-box'
+              ? 'bg-rose-950/90 border-b border-rose-500/40 text-rose-100'
+              : 'bg-emerald-950/90 border-b border-emerald-500/40 text-emerald-200'
+          } px-4 py-1.5 text-xs flex flex-wrap items-center justify-center gap-3 z-20`}
+        >
+          {activeTool === 'eraser-brush' || activeTool === 'eraser-box' ? (
+            <>
+              <span className="font-semibold text-rose-200">
+                🧽 Cục Tẩy Thông Minh (Tự hòa trộn nền, kể cả dưới khung chữ):
+              </span>
+
+              <div className="flex items-center bg-slate-950/80 p-0.5 rounded-lg border border-rose-500/30">
+                <button
+                  onClick={() => setActiveTool('eraser-brush')}
+                  className={`px-2.5 py-0.5 rounded-md text-[11px] font-medium transition ${
+                    activeTool === 'eraser-brush'
+                      ? 'bg-rose-600 text-white shadow'
+                      : 'text-rose-200/80 hover:text-white'
+                  }`}
+                >
+                  🖌️ Cọ bôi tự do
+                </button>
+                <button
+                  onClick={() => setActiveTool('eraser-box')}
+                  className={`px-2.5 py-0.5 rounded-md text-[11px] font-medium transition ${
+                    activeTool === 'eraser-box'
+                      ? 'bg-rose-600 text-white shadow'
+                      : 'text-rose-200/80 hover:text-white'
+                  }`}
+                >
+                  ⬜ Khoanh vùng xóa nhanh
+                </button>
+              </div>
+
+              {activeTool === 'eraser-brush' && (
+                <div className="flex items-center gap-2 bg-slate-950/70 px-2.5 py-0.5 rounded-lg border border-rose-500/30">
+                  <span className="text-[11px] text-rose-200">Cỡ tẩy:</span>
+                  <input
+                    type="range"
+                    min={4}
+                    max={50}
+                    value={eraserBrushSize}
+                    onChange={(e) => setEraserBrushSize(Number(e.target.value))}
+                    className="w-24 accent-rose-500 cursor-pointer"
+                  />
+                  <span className="text-[11px] font-mono w-8 text-right text-white">
+                    {eraserBrushSize}px
+                  </span>
+                </div>
+              )}
+
+              <button
+                disabled={eraserUndoStack.length === 0}
+                onClick={handleUndoErase}
+                className="px-2.5 py-0.5 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 border border-rose-400/40 text-white text-[11px] flex items-center gap-1 transition"
+                title="Hoàn tác nét tẩy vừa rồi (Ctrl+Z)"
+              >
+                <RotateCcw className="w-3 h-3" />
+                Hoàn tác ({eraserUndoStack.length})
+              </button>
+
+              <button
+                onClick={() => setActiveTool('select')}
+                className="px-2.5 py-0.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white font-medium text-[11px]"
+              >
+                Xong (ESC)
+              </button>
+            </>
+          ) : (
+            <>
+              <span>
+                {activeTool === 'snip-image'
+                  ? '✂️ Chế độ Cắt/Chọn Vùng Ảnh: Nhấn giữ chuột và kéo khung bao quanh bất kỳ hình ảnh/biểu đồ nào trên trang PDF để tách thành đối tượng ảnh có thể di chuyển & phóng to/thu nhỏ.'
+                  : '📝 Chế độ Thêm Khung Chữ: Nhấn giữ chuột và kéo trên trang PDF để tạo khung văn bản mới.'}
+              </span>
+              <button
+                onClick={() => setActiveTool('select')}
+                className="px-2 py-0.5 rounded bg-emerald-800 hover:bg-emerald-700 text-white text-[11px]"
+              >
+                Hủy (ESC)
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -1091,6 +1269,7 @@ export const App: React.FC = () => {
                     page={currentPage}
                     zoom={zoom}
                     activeTool={activeTool}
+                    eraserBrushSize={eraserBrushSize}
                     showBoundingBoxes={showBoundingBoxes}
                     selectedTextId={selectedTextId}
                     selectedImageId={selectedImageId}
@@ -1104,6 +1283,8 @@ export const App: React.FC = () => {
                     onDuplicateImageBlock={duplicateImageBlock}
                     onSnipImageRect={handleSnipImageRect}
                     onCreateTextBlockAt={handleCreateTextBlockAt}
+                    onEraseBrushStroke={handleEraseBrushStroke}
+                    onEraseRectRegion={handleEraseRectRegion}
                   />
                 </div>
               )}

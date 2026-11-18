@@ -233,8 +233,8 @@ export function calculateOptimalFontSize(
   const ctx = getMeasureContext();
   if (!ctx || !text.trim()) return originalFontSize;
 
-  const availW = Math.max(16, width - padding * 2);
-  const availH = Math.max(12, height - padding * 2);
+  const availW = Math.max(16, (width - padding * 2) * 0.94);
+  const availH = Math.max(12, height - padding * 2 - 2);
 
   const maxFont = allowScaleUp
     ? Math.min(Math.max(originalFontSize * 1.6, 26), 72)

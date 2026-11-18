@@ -26,6 +26,7 @@ interface PageCanvasEditorProps {
   page: PageData;
   zoom: number;
   activeTool: ActiveTool;
+  eraserBrushSize: number;
   showBoundingBoxes: boolean;
   selectedTextId: string | null;
   selectedImageId: string | null;
@@ -39,12 +40,14 @@ interface PageCanvasEditorProps {
   onDuplicateImageBlock: (id: string) => void;
   onSnipImageRect: (rect: { x: number; y: number; width: number; height: number }) => void;
   onCreateTextBlockAt: (rect: { x: number; y: number; width: number; height: number }) => void;
+  onEraseBrushStroke: (points: Array<{ x: number; y: number }>, radius: number) => void;
+  onEraseRectRegion: (rect: { x: number; y: number; width: number; height: number }) => void;
 }
 
 type HandleDir = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
 interface DragState {
-  kind: 'move-text' | 'resize-text' | 'move-image' | 'resize-image' | 'marquee';
+  kind: 'move-text' | 'resize-text' | 'move-image' | 'resize-image' | 'marquee' | 'eraser-brush';
   targetId?: string;
   handle?: HandleDir;
   startClientX: number;
@@ -59,6 +62,7 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
   page,
   zoom,
   activeTool,
+  eraserBrushSize,
   showBoundingBoxes,
   selectedTextId,
   selectedImageId,
@@ -72,16 +76,23 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
   onDuplicateImageBlock,
   onSnipImageRect,
   onCreateTextBlockAt,
+  onEraseBrushStroke,
+  onEraseRectRegion,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const brushPointsRef = useRef<Array<{ x: number; y: number }>>([]);
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [brushPoints, setBrushPoints] = useState<Array<{ x: number; y: number }>>([]);
+  const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null);
   const [marqueeRect, setMarqueeRect] = useState<{
     x: number;
     y: number;
     width: number;
     height: number;
   } | null>(null);
+
+  const isEraserMode = activeTool === 'eraser-brush' || activeTool === 'eraser-box';
 
   // Convert client mouse event to page coordinate space
   const getPageCoords = (clientX: number, clientY: number) => {
@@ -203,18 +214,40 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
         const rw = Math.min(page.width - rx, Math.abs(curX - dragState.initialX));
         const rh = Math.min(page.height - ry, Math.abs(curY - dragState.initialY));
         setMarqueeRect({ x: rx, y: ry, width: rw, height: rh });
+      } else if (dragState.kind === 'eraser-brush') {
+        const coords = getPageCoords(e.clientX, e.clientY);
+        const cx = Math.max(0, Math.min(page.width, coords.x));
+        const cy = Math.max(0, Math.min(page.height, coords.y));
+        setHoverPos({ x: cx, y: cy });
+        const pts = brushPointsRef.current;
+        const last = pts[pts.length - 1];
+        if (!last || Math.hypot(cx - last.x, cy - last.y) >= 1.5) {
+          const next = [...pts, { x: cx, y: cy }];
+          brushPointsRef.current = next;
+          setBrushPoints(next);
+        }
       }
     };
 
     const handleMouseUp = () => {
       if (dragState.kind === 'marquee' && marqueeRect) {
-        if (marqueeRect.width >= 18 && marqueeRect.height >= 14) {
+        if (activeTool === 'eraser-box') {
+          if (marqueeRect.width >= 4 && marqueeRect.height >= 4) {
+            onEraseRectRegion(marqueeRect);
+          }
+        } else if (marqueeRect.width >= 18 && marqueeRect.height >= 14) {
           if (activeTool === 'snip-image') {
             onSnipImageRect(marqueeRect);
           } else if (activeTool === 'add-text') {
             onCreateTextBlockAt(marqueeRect);
           }
         }
+      } else if (dragState.kind === 'eraser-brush') {
+        if (brushPointsRef.current.length > 0) {
+          onEraseBrushStroke(brushPointsRef.current, eraserBrushSize);
+        }
+        brushPointsRef.current = [];
+        setBrushPoints([]);
       }
       setDragState(null);
       setMarqueeRect(null);
@@ -232,21 +265,53 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
     zoom,
     page,
     activeTool,
+    eraserBrushSize,
     onUpdateTextBlock,
     onUpdateImageBlock,
     onSnipImageRect,
     onCreateTextBlockAt,
+    onEraseBrushStroke,
+    onEraseRectRegion,
   ]);
 
   const handleCanvasMouseDown = (e: React.MouseEvent) => {
-    if (e.target !== containerRef.current && !(e.target as HTMLElement).dataset.canvasBg) {
+    if (
+      !isEraserMode &&
+      e.target !== containerRef.current &&
+      !(e.target as HTMLElement).dataset.canvasBg
+    ) {
       return;
     }
     onSelectText(null);
     onSelectImage(null);
     setEditingTextId(null);
 
-    if (activeTool === 'snip-image' || activeTool === 'add-text') {
+    if (activeTool === 'eraser-brush') {
+      const coords = getPageCoords(e.clientX, e.clientY);
+      const pt = {
+        x: Math.max(0, Math.min(page.width, coords.x)),
+        y: Math.max(0, Math.min(page.height, coords.y)),
+      };
+      brushPointsRef.current = [pt];
+      setBrushPoints([pt]);
+      setHoverPos(pt);
+      setDragState({
+        kind: 'eraser-brush',
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        initialX: pt.x,
+        initialY: pt.y,
+        initialW: 0,
+        initialH: 0,
+      });
+      return;
+    }
+
+    if (
+      activeTool === 'snip-image' ||
+      activeTool === 'add-text' ||
+      activeTool === 'eraser-box'
+    ) {
       const coords = getPageCoords(e.clientX, e.clientY);
       setDragState({
         kind: 'marquee',
@@ -293,11 +358,27 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
     <div
       ref={containerRef}
       onMouseDown={handleCanvasMouseDown}
+      onMouseMove={(e) => {
+        if (activeTool === 'eraser-brush') {
+          const coords = getPageCoords(e.clientX, e.clientY);
+          setHoverPos({
+            x: Math.max(0, Math.min(page.width, coords.x)),
+            y: Math.max(0, Math.min(page.height, coords.y)),
+          });
+        }
+      }}
+      onMouseLeave={() => {
+        if (!dragState) setHoverPos(null);
+      }}
       style={{
         width: page.width * zoom,
         height: page.height * zoom,
         cursor:
-          activeTool === 'snip-image' || activeTool === 'add-text'
+          activeTool === 'eraser-brush'
+            ? 'none'
+            : activeTool === 'snip-image' ||
+              activeTool === 'add-text' ||
+              activeTool === 'eraser-box'
             ? 'crosshair'
             : 'default',
       }}
@@ -392,6 +473,8 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
               zIndex: isSelected ? 25 : 12,
             }}
             className={`group absolute transition-shadow ${
+              isEraserMode ? 'pointer-events-none ' : ''
+            }${
               isSelected
                 ? 'ring-2 ring-emerald-500 shadow-lg'
                 : showBoundingBoxes
@@ -542,6 +625,8 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
               zIndex: isSelected ? 30 : 15,
             }}
             className={`group absolute transition-shadow ${
+              isEraserMode ? 'pointer-events-none ' : ''
+            }${
               isSelected
                 ? 'ring-2 ring-indigo-500 shadow-lg'
                 : showBoundingBoxes
@@ -712,7 +797,9 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
                   lineBreak: 'strict',
                   whiteSpace: 'pre-wrap',
                 }}
-                className="w-full h-full overflow-hidden cursor-move"
+                className={`w-full h-full cursor-move ${
+                  tb.bgOpacity === 0 ? 'overflow-visible' : 'overflow-hidden'
+                }`}
               >
                 {displayText}
               </div>
@@ -736,7 +823,7 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
         );
       })}
 
-      {/* 6. Active Marquee Selection Box (for Snipping Image or Adding Text Box) */}
+      {/* 6. Active Marquee Selection Box (for Snipping Image, Adding Text Box, or Magic Box Eraser) */}
       {marqueeRect && (
         <div
           style={{
@@ -748,15 +835,63 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
           className={`absolute z-50 pointer-events-none border-2 border-dashed ${
             activeTool === 'snip-image'
               ? 'border-emerald-400 bg-emerald-500/15'
+              : activeTool === 'eraser-box'
+              ? 'border-rose-400 bg-rose-500/20'
               : 'border-indigo-400 bg-indigo-500/15'
           }`}
         >
           <span className="absolute -top-6 left-0 bg-slate-900 text-white text-[10px] px-1.5 py-0.5 rounded shadow">
             {activeTool === 'snip-image'
               ? `Cắt ảnh: ${Math.round(marqueeRect.width)}×${Math.round(marqueeRect.height)}`
+              : activeTool === 'eraser-box'
+              ? `🧽 Xóa vùng: ${Math.round(marqueeRect.width)}×${Math.round(marqueeRect.height)}`
               : `Thêm chữ: ${Math.round(marqueeRect.width)}×${Math.round(marqueeRect.height)}`}
           </span>
         </div>
+      )}
+
+      {/* 7. Live Magic Eraser Brush Trail & Circular Cursor Overlay */}
+      {activeTool === 'eraser-brush' && (
+        <>
+          {brushPoints.length > 0 && (
+            <svg
+              width={page.width * zoom}
+              height={page.height * zoom}
+              className="absolute inset-0 z-40 pointer-events-none"
+            >
+              {brushPoints.length === 1 ? (
+                <circle
+                  cx={brushPoints[0].x * zoom}
+                  cy={brushPoints[0].y * zoom}
+                  r={eraserBrushSize * zoom}
+                  fill="rgba(244, 63, 94, 0.38)"
+                />
+              ) : (
+                <polyline
+                  points={brushPoints
+                    .map((p) => `${p.x * zoom},${p.y * zoom}`)
+                    .join(' ')}
+                  fill="none"
+                  stroke="rgba(244, 63, 94, 0.42)"
+                  strokeWidth={eraserBrushSize * 2 * zoom}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              )}
+            </svg>
+          )}
+          {hoverPos && (
+            <div
+              style={{
+                left: (hoverPos.x - eraserBrushSize) * zoom,
+                top: (hoverPos.y - eraserBrushSize) * zoom,
+                width: eraserBrushSize * 2 * zoom,
+                height: eraserBrushSize * 2 * zoom,
+              }}
+              className="absolute z-50 pointer-events-none rounded-full border-2 border-rose-400 bg-rose-500/15 shadow-[0_0_0_1px_rgba(15,23,42,0.85)]"
+            />
+          )}
+        </>
       )}
     </div>
   );
