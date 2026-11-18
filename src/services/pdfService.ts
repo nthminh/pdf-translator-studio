@@ -1111,3 +1111,219 @@ export async function exportPagesToPdf(
 
   pdf.save(filename);
 }
+
+export interface VisionDetectedBox {
+  ymin: number;
+  xmin: number;
+  ymax: number;
+  xmax: number;
+  originalText: string;
+  translatedText: string;
+  align?: string;
+  isBold?: boolean;
+}
+
+/**
+ * Loads an uploaded image (.png / .jpg / .webp) directly as a single PageData object
+ * so posters and scanned images can be translated and exported to PDF seamlessly.
+ */
+export async function parseImageFile(file: File): Promise<PageData[]> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Không thể đọc tệp hình ảnh.'));
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const img = new Image();
+      img.onerror = () => reject(new Error('Định dạng hình ảnh không hợp lệ.'));
+      img.onload = () => {
+        const aspect = img.height / Math.max(1, img.width);
+        const pageWidth = img.width > img.height ? 842 : 595;
+        const pageHeight = Math.max(240, Math.round(pageWidth * aspect));
+        resolve([
+          {
+            pageIndex: 0,
+            width: pageWidth,
+            height: pageHeight,
+            backgroundDataUrl: dataUrl,
+            textBlocks: [],
+            imageBlocks: [],
+          },
+        ]);
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function sampleSmartVisionColors(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  scaleX: number,
+  scaleY: number
+): { bgHex: string; fgHex: string } {
+  try {
+    const sx = Math.max(0, Math.floor(x * scaleX));
+    const sy = Math.max(0, Math.floor(y * scaleY));
+    const sw = Math.min(ctx.canvas.width - sx, Math.max(4, Math.ceil(width * scaleX)));
+    const sh = Math.min(ctx.canvas.height - sy, Math.max(4, Math.ceil(height * scaleY)));
+    if (sw <= 0 || sh <= 0) return { bgHex: '#ffffff', fgHex: '#0f172a' };
+
+    const data = ctx.getImageData(sx, sy, sw, sh).data;
+    // 1. Collect border + interior pixels and find dominant/median background cluster
+    const rs: number[] = [];
+    const gs: number[] = [];
+    const bs: number[] = [];
+    const step = Math.max(4, Math.floor((data.length / 4) / 320) * 4);
+    for (let i = 0; i < data.length; i += step) {
+      rs.push(data[i]);
+      gs.push(data[i + 1]);
+      bs.push(data[i + 2]);
+    }
+    if (rs.length === 0) return { bgHex: '#ffffff', fgHex: '#0f172a' };
+
+    const sortedR = [...rs].sort((a, b) => a - b);
+    const sortedG = [...gs].sort((a, b) => a - b);
+    const sortedB = [...bs].sort((a, b) => a - b);
+    const mid = Math.floor(sortedR.length / 2);
+    const bgR = sortedR[mid];
+    const bgG = sortedG[mid];
+    const bgB = sortedB[mid];
+    const bgHex = rgbToHex(bgR, bgG, bgB);
+
+    // 2. Find high-contrast foreground text pixels inside the box
+    const contrastPixels: Array<{ dist: number; r: number; g: number; b: number }> = [];
+    for (let i = 0; i < rs.length; i++) {
+      const dist = Math.abs(rs[i] - bgR) + Math.abs(gs[i] - bgG) + Math.abs(bs[i] - bgB);
+      if (dist >= 65) {
+        contrastPixels.push({ dist, r: rs[i], g: gs[i], b: bs[i] });
+      }
+    }
+
+    if (contrastPixels.length >= 3) {
+      contrastPixels.sort((a, b) => b.dist - a.dist);
+      const topSlice = contrastPixels.slice(0, Math.max(3, Math.ceil(contrastPixels.length * 0.25)));
+      const avgR = topSlice.reduce((s, p) => s + p.r, 0) / topSlice.length;
+      const avgG = topSlice.reduce((s, p) => s + p.g, 0) / topSlice.length;
+      const avgB = topSlice.reduce((s, p) => s + p.b, 0) / topSlice.length;
+      return { bgHex, fgHex: rgbToHex(avgR, avgG, avgB) };
+    }
+
+    const luminance = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
+    return {
+      bgHex,
+      fgHex: luminance < 135 ? '#ffffff' : '#0f172a',
+    };
+  } catch {
+    return { bgHex: '#ffffff', fgHex: '#0f172a' };
+  }
+}
+
+/**
+ * Converts normalized 0..1000 Gemini Vision bounding boxes into styled, editable TextBlocks
+ * with sampled poster background & contrasting text colors.
+ */
+export async function buildVisionOcrTextBlocks(
+  page: PageData,
+  rawBoxes: VisionDetectedBox[]
+): Promise<TextBlock[]> {
+  if (!rawBoxes || rawBoxes.length === 0) return [];
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onerror = () => resolve([]);
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+
+      const scaleX = img.width / page.width;
+      const scaleY = img.height / page.height;
+      const stamp = Date.now().toString(36);
+      const blocks: TextBlock[] = [];
+
+      rawBoxes.forEach((box, idx) => {
+        const origTxt = String(box.originalText || '').trim();
+        const transTxt = String(box.translatedText || origTxt).trim();
+        if (!origTxt && !transTxt) return;
+
+        const ymin = Math.max(0, Math.min(1000, Number(box.ymin) || 0));
+        const xmin = Math.max(0, Math.min(1000, Number(box.xmin) || 0));
+        const ymax = Math.max(ymin + 8, Math.min(1000, Number(box.ymax) || ymin + 24));
+        const xmax = Math.max(xmin + 16, Math.min(1000, Number(box.xmax) || xmin + 80));
+
+        const x = Math.max(2, Math.round((xmin / 1000) * page.width) - 2);
+        const y = Math.max(2, Math.round((ymin / 1000) * page.height) - 1);
+        const width = Math.min(
+          page.width - x - 2,
+          Math.max(28, Math.round(((xmax - xmin) / 1000) * page.width) + 4)
+        );
+        const height = Math.min(
+          page.height - y - 2,
+          Math.max(14, Math.round(((ymax - ymin) / 1000) * page.height) + 3)
+        );
+
+        const { bgHex, fgHex } = sampleSmartVisionColors(
+          ctx,
+          x,
+          y,
+          width,
+          height,
+          scaleX,
+          scaleY
+        );
+
+        const lineCount = Math.max(
+          1,
+          origTxt.split(/\r?\n/).length,
+          Math.round(origTxt.length / Math.max(10, width / 7))
+        );
+        const estimatedFontSize = Math.max(
+          7.5,
+          Math.min(36, Number(((height / lineCount) * 0.68).toFixed(1)))
+        );
+
+        const rawAlign = String(box.align || '').toLowerCase();
+        const textAlign: TextBlock['textAlign'] =
+          rawAlign === 'center' || rawAlign === 'right' ? rawAlign : 'left';
+
+        blocks.push({
+          id: `p${page.pageIndex}_ocr_${idx}_${stamp}`,
+          pageIndex: page.pageIndex,
+          x,
+          y,
+          width,
+          height,
+          origX: x,
+          origY: y,
+          origWidth: width,
+          origHeight: height,
+          originalText: origTxt,
+          translatedText: transTxt,
+          fontSize: estimatedFontSize,
+          originalFontSize: estimatedFontSize,
+          autoFit: true,
+          fontFamily: '"Noto Sans", Inter, sans-serif',
+          fontWeight: box.isBold || estimatedFontSize >= 15 ? 'bold' : 'normal',
+          fontStyle: 'normal',
+          color: fgHex,
+          backgroundColor: bgHex,
+          bgOpacity: 1,
+          textAlign,
+          lineHeight: 1.18,
+          padding: 2,
+          visible: true,
+          isTranslated: true,
+        });
+      });
+
+      resolve(blocks);
+    };
+    img.src = page.backgroundDataUrl;
+  });
+}

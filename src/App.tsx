@@ -10,11 +10,16 @@ import {
 } from './types';
 import {
   parsePdfFile,
+  parseImageFile,
+  buildVisionOcrTextBlocks,
   createSampleDocumentPages,
   snipImageRegionFromPage,
   exportPagesToPdf,
 } from './services/pdfService';
-import { translateTextBlocks } from './services/translationService';
+import {
+  translateTextBlocks,
+  visionOcrAndTranslatePage,
+} from './services/translationService';
 import { fitTextBlock, autoAlignAndFitPage } from './utils/autoFit';
 import { PageCanvasEditor } from './components/PageCanvasEditor';
 import { InspectorPanel } from './components/InspectorPanel';
@@ -37,6 +42,7 @@ import {
   Wand2,
   RotateCcw,
   BoxSelect,
+  ScanText,
 } from 'lucide-react';
 
 export const App: React.FC = () => {
@@ -91,31 +97,38 @@ export const App: React.FC = () => {
     localStorage.setItem('GEMINI_API_KEY', val);
   };
 
-  // Upload & Parse PDF
+  // Upload & Parse PDF or Image Poster
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setIsBusy(true);
-    setStatusMessage('Đang phân tích bố cục, phông chữ & màu nền PDF...');
+    setStatusMessage('Đang phân tích bố cục, phông chữ & màu nền tài liệu...');
     setSelectedTextId(null);
     setSelectedImageId(null);
 
     try {
-      const parsedPages = await parsePdfFile(
-        file,
-        mergeParagraphsOnLoad,
-        (cur, total) => {
-          setStatusMessage(`Đang trích xuất trang ${cur}/${total}...`);
-        }
-      );
+      const isImage =
+        file.type.startsWith('image/') ||
+        /\.(png|jpe?g|webp|bmp)$/i.test(file.name);
+      const parsedPages = isImage
+        ? await parseImageFile(file)
+        : await parsePdfFile(file, mergeParagraphsOnLoad, (cur, total) => {
+            setStatusMessage(`Đang trích xuất trang ${cur}/${total}...`);
+          });
       setPages(parsedPages);
       setCurrentPageIdx(0);
       setDocumentName(file.name);
       const totalBlocks = parsedPages.reduce((acc, p) => acc + p.textBlocks.length, 0);
-      setLastStats(`Đã tải ${parsedPages.length} trang (${totalBlocks} khung văn bản)`);
+      if (totalBlocks === 0) {
+        setLastStats(
+          `Đã tải ${parsedPages.length} trang dạng Ảnh / Poster — Bấm "Dịch Ngay" để AI tự quét chữ & dịch!`
+        );
+      } else {
+        setLastStats(`Đã tải ${parsedPages.length} trang (${totalBlocks} khung văn bản)`);
+      }
     } catch (err: any) {
-      alert('Không thể đọc file PDF: ' + (err?.message || String(err)));
+      alert('Không thể đọc tệp: ' + (err?.message || String(err)));
     } finally {
       setIsBusy(false);
       setStatusMessage('');
@@ -123,44 +136,125 @@ export const App: React.FC = () => {
     }
   };
 
-  // Translate Current Page or All Pages
-  const handleTranslate = async (allPages: boolean = true) => {
-    if (pages.length === 0) return;
-
-    const targetPages = allPages ? pages : currentPage ? [currentPage] : [];
-    const allBlocks = targetPages.flatMap((p) => p.textBlocks);
-    if (allBlocks.length === 0) return;
-
-    // If user chose Gemini engine but hasn't entered an API key yet, automatically use Google Free with a helpful note or let them enter key
-    let effectiveEngine: TranslationEngine = engine;
-    if (
-      (engine === 'gemini-3.8-flash' || engine === 'gemini-3.5-flash-lite') &&
-      !apiKey.trim()
-    ) {
-      effectiveEngine = 'google-free';
-    }
-
+  // Run AI Vision OCR + Translation explicitly on the current page (for Poster / Canva / Scan PDFs)
+  const handleVisionOcrCurrentPage = async () => {
+    if (!currentPage || isBusy) return;
     setIsBusy(true);
     const startTime = performance.now();
-    setStatusMessage(`Đang dịch ${allBlocks.length} khung văn bản...`);
+    setStatusMessage(
+      `🔍 Đang quét chữ Poster / Ảnh trang ${currentPageIdx + 1} & dịch bằng Gemini AI Vision...`
+    );
 
     try {
-      const translatedMap = await translateTextBlocks({
-        blocks: allBlocks,
+      const detectedBoxes = await visionOcrAndTranslatePage({
+        backgroundDataUrl: currentPage.backgroundDataUrl,
         sourceLang,
         targetLang,
-        engine: effectiveEngine,
+        engine,
         apiKey,
-        keepConciseForLayout: autoFitOnTranslate,
-        onProgress: (done, total) => {
-          setStatusMessage(`Đang dịch siêu tốc: ${done}/${total} đoạn...`);
-        },
       });
+
+      if (detectedBoxes.length === 0) {
+        alert('Không tìm thấy vùng văn bản cần dịch trên trang này.');
+        return;
+      }
+
+      const rawVisionBlocks = await buildVisionOcrTextBlocks(
+        currentPage,
+        detectedBoxes
+      );
+      const fittedBlocks = rawVisionBlocks.map((tb) => fitTextBlock(tb));
+      setViewMode('translated');
+
+      setPages((prev) =>
+        prev.map((p, idx) =>
+          idx === currentPageIdx ? { ...p, textBlocks: fittedBlocks } : p
+        )
+      );
+
+      const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(2);
+      setLastStats(
+        `✨ AI Vision đã quét & dịch ${fittedBlocks.length} vùng chữ trong ${elapsedSec}s!`
+      );
+    } catch (err: any) {
+      alert('Lỗi quét chữ AI Vision: ' + (err?.message || String(err)));
+    } finally {
+      setIsBusy(false);
+      setStatusMessage('');
+    }
+  };
+
+  // Translate Current Page or All Pages (Automatically handles BOTH text-layer PDFs AND 0-text Poster/Image PDFs!)
+  const handleTranslate = async (allPages: boolean = true) => {
+    if (pages.length === 0 || isBusy) return;
+
+    const targetPages = allPages ? pages : currentPage ? [currentPage] : [];
+    const visionTargetIndices = targetPages
+      .filter((p) => p.textBlocks.length === 0)
+      .map((p) => p.pageIndex);
+    const allExistingBlocks = targetPages.flatMap((p) => p.textBlocks);
+
+    if (allExistingBlocks.length === 0 && visionTargetIndices.length === 0) return;
+
+    setIsBusy(true);
+    setViewMode('translated');
+    const startTime = performance.now();
+
+    try {
+      // 1. Automatically run AI Vision OCR + Translation on any Poster / Scan / Image PDF pages (0 text layer items)
+      const visionBlocksByPage = new Map<number, TextBlock[]>();
+      let visionTotalCount = 0;
+
+      if (visionTargetIndices.length > 0) {
+        for (let i = 0; i < visionTargetIndices.length; i++) {
+          const pIdx = visionTargetIndices[i];
+          const pageObj = pages[pIdx];
+          if (!pageObj) continue;
+          setStatusMessage(
+            `🔍 Phát hiện PDF dạng Ảnh/Poster — AI đang quét chữ & dịch trang ${i + 1}/${visionTargetIndices.length}...`
+          );
+          const detectedBoxes = await visionOcrAndTranslatePage({
+            backgroundDataUrl: pageObj.backgroundDataUrl,
+            sourceLang,
+            targetLang,
+            engine,
+            apiKey,
+          });
+          const rawBlocks = await buildVisionOcrTextBlocks(pageObj, detectedBoxes);
+          const fitted = rawBlocks.map((tb) => fitTextBlock(tb));
+          visionBlocksByPage.set(pIdx, fitted);
+          visionTotalCount += fitted.length;
+        }
+      }
+
+      // 2. Translate standard selectable text blocks (if any)
+      let translatedMap = new Map<string, string>();
+      if (allExistingBlocks.length > 0) {
+        setStatusMessage(`Đang dịch ${allExistingBlocks.length} khung văn bản...`);
+        translatedMap = await translateTextBlocks({
+          blocks: allExistingBlocks,
+          sourceLang,
+          targetLang,
+          engine,
+          apiKey,
+          keepConciseForLayout: autoFitOnTranslate,
+          onProgress: (done, total) => {
+            setStatusMessage(`Đang dịch siêu tốc: ${done}/${total} đoạn...`);
+          },
+        });
+      }
 
       setPages((prevPages) =>
         prevPages.map((p) => {
           const isTargetPage = allPages || p.pageIndex === currentPageIdx;
           if (!isTargetPage) return p;
+
+          if (visionBlocksByPage.has(p.pageIndex)) {
+            return {
+              ...p,
+              textBlocks: visionBlocksByPage.get(p.pageIndex) || [],
+            };
+          }
 
           const updatedBlocks = p.textBlocks.map((tb) => {
             const newText = translatedMap.get(tb.id);
@@ -184,13 +278,12 @@ export const App: React.FC = () => {
         })
       );
 
+      const totalDone = allExistingBlocks.length + visionTotalCount;
       const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(2);
-      const engineBadge =
-        effectiveEngine === 'google-free' && engine !== 'google-free'
-          ? 'Chế độ Dịch Nhanh (Nhập Gemini Key nếu muốn dùng AI sâu)'
-          : effectiveEngine;
       setLastStats(
-        `Đã dịch ${allBlocks.length} đoạn trong ${elapsedSec}s (${engineBadge})`
+        visionTotalCount > 0
+          ? `✨ Đã quét OCR & dịch ${totalDone} vùng chữ Poster/PDF trong ${elapsedSec}s`
+          : `Đã dịch ${totalDone} đoạn trong ${elapsedSec}s (${engine})`
       );
     } catch (err: any) {
       alert('Lỗi khi dịch: ' + (err?.message || String(err)));
@@ -541,7 +634,7 @@ export const App: React.FC = () => {
           <input
             ref={fileInputRef}
             type="file"
-            accept="application/pdf"
+            accept="application/pdf,image/png,image/jpeg,image/webp"
             className="hidden"
             onChange={handleFileChange}
           />
@@ -550,7 +643,7 @@ export const App: React.FC = () => {
             className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-100 flex items-center gap-1.5 transition"
           >
             <FileUp className="w-3.5 h-3.5 text-indigo-400" />
-            Tải PDF Lên
+            Tải PDF / Ảnh
           </button>
 
           <button
@@ -706,6 +799,16 @@ export const App: React.FC = () => {
           </button>
 
           <div className="h-4 w-px bg-slate-800 mx-1" />
+
+          <button
+            disabled={isBusy}
+            onClick={handleVisionOcrCurrentPage}
+            className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-amber-300 disabled:opacity-50 flex items-center gap-1.5 font-medium transition"
+            title="Quét nhận diện chữ bằng AI Vision cho file PDF dạng ảnh phẳng / Poster thiết kế Canva / File Scan"
+          >
+            <ScanText className="w-3.5 h-3.5" />
+            Quét Chữ AI (Poster/Scan)
+          </button>
 
           <button
             onClick={handleAutoAlignCurrentPage}
