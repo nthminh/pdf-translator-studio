@@ -303,9 +303,9 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
       }}
       className="relative bg-white shadow-2xl rounded-sm select-none overflow-hidden ring-1 ring-slate-700/60"
     >
-      {/* 1. Base Rendered PDF Background */}
+      {/* 1. Base Rendered PDF Background (uses clean inpainted background when available) */}
       <img
-        src={page.backgroundDataUrl}
+        src={page.cleanBackgroundDataUrl || page.backgroundDataUrl}
         alt={`Page ${page.pageIndex + 1}`}
         data-canvas-bg="true"
         draggable={false}
@@ -338,24 +338,26 @@ export const PageCanvasEditor: React.FC<PageCanvasEditorProps> = ({
         );
       })}
 
-      {/* 3. Clean Background Erase Masks for Original Text Positions */}
-      {page.textBlocks.map((tb) => {
-        const maskW = Math.min(tb.origWidth, tb.width + 4);
-        return (
-          <div
-            key={`mask_tb_${tb.id}`}
-            data-canvas-bg="true"
-            style={{
-              left: (tb.origX - 1) * zoom,
-              top: (tb.origY - 1) * zoom,
-              width: (maskW + 2) * zoom,
-              height: (tb.origHeight + 2) * zoom,
-              backgroundColor: tb.backgroundColor || '#ffffff',
-            }}
-            className="absolute pointer-events-none"
-          />
-        );
-      })}
+      {/* 3. Clean Background Erase Masks for Original Text Positions (skipped when background is seamlessly inpainted) */}
+      {!page.cleanBackgroundDataUrl &&
+        page.textBlocks.map((tb) => {
+          if (!tb.origWidth || !tb.origHeight) return null;
+          const maskW = Math.min(tb.origWidth, tb.width + 4);
+          return (
+            <div
+              key={`mask_tb_${tb.id}`}
+              data-canvas-bg="true"
+              style={{
+                left: (tb.origX - 1) * zoom,
+                top: (tb.origY - 1) * zoom,
+                width: (maskW + 2) * zoom,
+                height: (tb.origHeight + 2) * zoom,
+                backgroundColor: tb.backgroundColor || '#ffffff',
+              }}
+              className="absolute pointer-events-none"
+            />
+          );
+        })}
 
       {/* 4. Interactive Image Blocks Layer */}
       {page.imageBlocks.map((img) => {

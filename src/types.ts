@@ -58,6 +58,8 @@ export interface PageData {
   width: number;
   height: number;
   backgroundDataUrl: string;
+  /** Seamless inpainted background with original text strokes erased so text boxes can be 100% transparent */
+  cleanBackgroundDataUrl?: string;
   textBlocks: TextBlock[];
   imageBlocks: ImageBlock[];
 }

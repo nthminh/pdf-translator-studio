@@ -957,8 +957,8 @@ export async function renderCompositePageCanvas(
   const ctx = canvas.getContext('2d')!;
   ctx.scale(exportScale, exportScale);
 
-  // 1. Draw base PDF background
-  const bgImg = await loadImage(page.backgroundDataUrl);
+  // 1. Draw base PDF background (uses clean inpainted background when available)
+  const bgImg = await loadImage(page.cleanBackgroundDataUrl || page.backgroundDataUrl);
   ctx.drawImage(bgImg, 0, 0, page.width, page.height);
 
   // 2. Mask original positions of snipped/moved images
@@ -979,12 +979,15 @@ export async function renderCompositePageCanvas(
     }
   }
 
-  // 3. Mask original positions of text blocks so original PDF text never bleeds through
-  for (const tb of page.textBlocks) {
-    // Clamp original mask width to tb.width if tb was clamped to a visual container
-    const maskW = Math.min(tb.origWidth, tb.width + 4);
-    ctx.fillStyle = tb.backgroundColor || '#ffffff';
-    ctx.fillRect(tb.origX - 1, tb.origY - 1, maskW + 2, tb.origHeight + 2);
+  // 3. Mask original positions of text blocks ONLY if page background was not already inpainted
+  if (!page.cleanBackgroundDataUrl) {
+    for (const tb of page.textBlocks) {
+      if (!tb.origWidth || !tb.origHeight) continue;
+      // Clamp original mask width to tb.width if tb was clamped to a visual container
+      const maskW = Math.min(tb.origWidth, tb.width + 4);
+      ctx.fillStyle = tb.backgroundColor || '#ffffff';
+      ctx.fillRect(tb.origX - 1, tb.origY - 1, maskW + 2, tb.origHeight + 2);
+    }
   }
 
   // 4. Draw visible ImageBlocks
@@ -1156,91 +1159,384 @@ export async function parseImageFile(file: File): Promise<PageData[]> {
   });
 }
 
-function sampleSmartVisionColors(
-  ctx: CanvasRenderingContext2D,
+function separateBgAndInkColors(
+  srcCtx: CanvasRenderingContext2D,
   x: number,
   y: number,
   width: number,
   height: number,
   scaleX: number,
   scaleY: number
-): { bgHex: string; fgHex: string } {
+): {
+  bgRgb: [number, number, number];
+  fgRgb: [number, number, number];
+  bgHex: string;
+  fgHex: string;
+} {
   try {
     const sx = Math.max(0, Math.floor(x * scaleX));
     const sy = Math.max(0, Math.floor(y * scaleY));
-    const sw = Math.min(ctx.canvas.width - sx, Math.max(4, Math.ceil(width * scaleX)));
-    const sh = Math.min(ctx.canvas.height - sy, Math.max(4, Math.ceil(height * scaleY)));
-    if (sw <= 0 || sh <= 0) return { bgHex: '#ffffff', fgHex: '#0f172a' };
-
-    const data = ctx.getImageData(sx, sy, sw, sh).data;
-    // 1. Collect border + interior pixels and find dominant/median background cluster
-    const rs: number[] = [];
-    const gs: number[] = [];
-    const bs: number[] = [];
-    const step = Math.max(4, Math.floor((data.length / 4) / 320) * 4);
-    for (let i = 0; i < data.length; i += step) {
-      rs.push(data[i]);
-      gs.push(data[i + 1]);
-      bs.push(data[i + 2]);
+    const sw = Math.min(srcCtx.canvas.width - sx, Math.max(4, Math.ceil(width * scaleX)));
+    const sh = Math.min(srcCtx.canvas.height - sy, Math.max(4, Math.ceil(height * scaleY)));
+    if (sw <= 0 || sh <= 0) {
+      return {
+        bgRgb: [255, 255, 255],
+        fgRgb: [15, 23, 42],
+        bgHex: '#ffffff',
+        fgHex: '#0f172a',
+      };
     }
-    if (rs.length === 0) return { bgHex: '#ffffff', fgHex: '#0f172a' };
 
-    const sortedR = [...rs].sort((a, b) => a - b);
-    const sortedG = [...gs].sort((a, b) => a - b);
-    const sortedB = [...bs].sort((a, b) => a - b);
-    const mid = Math.floor(sortedR.length / 2);
-    const bgR = sortedR[mid];
-    const bgG = sortedG[mid];
-    const bgB = sortedB[mid];
-    const bgHex = rgbToHex(bgR, bgG, bgB);
+    const data = srcCtx.getImageData(sx, sy, sw, sh).data;
+    // Seed background cluster from the perimeter border pixels of the box
+    const edgeR: number[] = [];
+    const edgeG: number[] = [];
+    const edgeB: number[] = [];
+    for (let cx = 0; cx < sw; cx += 2) {
+      const topIdx = cx * 4;
+      const botIdx = ((sh - 1) * sw + cx) * 4;
+      edgeR.push(data[topIdx], data[botIdx]);
+      edgeG.push(data[topIdx + 1], data[botIdx + 1]);
+      edgeB.push(data[topIdx + 2], data[botIdx + 2]);
+    }
+    for (let cy = 1; cy < sh - 1; cy += 2) {
+      const leftIdx = (cy * sw) * 4;
+      const rightIdx = (cy * sw + (sw - 1)) * 4;
+      edgeR.push(data[leftIdx], data[rightIdx]);
+      edgeG.push(data[leftIdx + 1], data[rightIdx + 1]);
+      edgeB.push(data[leftIdx + 2], data[rightIdx + 2]);
+    }
 
-    // 2. Find high-contrast foreground text pixels inside the box
-    const contrastPixels: Array<{ dist: number; r: number; g: number; b: number }> = [];
-    for (let i = 0; i < rs.length; i++) {
-      const dist = Math.abs(rs[i] - bgR) + Math.abs(gs[i] - bgG) + Math.abs(bs[i] - bgB);
-      if (dist >= 65) {
-        contrastPixels.push({ dist, r: rs[i], g: gs[i], b: bs[i] });
+    edgeR.sort((a, b) => a - b);
+    edgeG.sort((a, b) => a - b);
+    edgeB.sort((a, b) => a - b);
+    const eMid = Math.floor(edgeR.length / 2);
+    let c0R = edgeR[eMid] ?? 255;
+    let c0G = edgeG[eMid] ?? 255;
+    let c0B = edgeB[eMid] ?? 255;
+
+    // Seed ink cluster from the interior pixel farthest from c0
+    let c1R = c0R < 128 ? 255 : 15;
+    let c1G = c0G < 128 ? 255 : 23;
+    let c1B = c0B < 128 ? 255 : 42;
+    let maxDist = 0;
+
+    const totalPx = sw * sh;
+    const sampleStep = Math.max(1, Math.floor(totalPx / 600));
+    for (let p = 0; p < totalPx; p += sampleStep) {
+      const idx = p * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const d = Math.abs(r - c0R) + Math.abs(g - c0G) + Math.abs(b - c0B);
+      if (d > maxDist) {
+        maxDist = d;
+        c1R = r;
+        c1G = g;
+        c1B = b;
       }
     }
 
-    if (contrastPixels.length >= 3) {
-      contrastPixels.sort((a, b) => b.dist - a.dist);
-      const topSlice = contrastPixels.slice(0, Math.max(3, Math.ceil(contrastPixels.length * 0.25)));
-      const avgR = topSlice.reduce((s, p) => s + p.r, 0) / topSlice.length;
-      const avgG = topSlice.reduce((s, p) => s + p.g, 0) / topSlice.length;
-      const avgB = topSlice.reduce((s, p) => s + p.b, 0) / topSlice.length;
-      return { bgHex, fgHex: rgbToHex(avgR, avgG, avgB) };
+    // 2-means k-means refinement (7 iterations) cleanly separates background vs letter ink without color mixing!
+    if (maxDist >= 42) {
+      for (let iter = 0; iter < 7; iter++) {
+        let s0R = 0, s0G = 0, s0B = 0, n0 = 0;
+        let s1R = 0, s1G = 0, s1B = 0, n1 = 0;
+        for (let p = 0; p < totalPx; p += sampleStep) {
+          const idx = p * 4;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+          const d0 = Math.abs(r - c0R) + Math.abs(g - c0G) + Math.abs(b - c0B);
+          const d1 = Math.abs(r - c1R) + Math.abs(g - c1G) + Math.abs(b - c1B);
+          if (d0 <= d1) {
+            s0R += r; s0G += g; s0B += b; n0++;
+          } else {
+            s1R += r; s1G += g; s1B += b; n1++;
+          }
+        }
+        if (n0 > 0) { c0R = s0R / n0; c0G = s0G / n0; c0B = s0B / n0; }
+        if (n1 > 0) { c1R = s1R / n1; c1G = s1G / n1; c1B = s1B / n1; }
+      }
     }
 
-    const luminance = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
+    const bgRgb: [number, number, number] = [
+      Math.round(c0R),
+      Math.round(c0G),
+      Math.round(c0B),
+    ];
+    let fgRgb: [number, number, number] = [
+      Math.round(c1R),
+      Math.round(c1G),
+      Math.round(c1B),
+    ];
+
+    const sep =
+      Math.abs(fgRgb[0] - bgRgb[0]) +
+      Math.abs(fgRgb[1] - bgRgb[1]) +
+      Math.abs(fgRgb[2] - bgRgb[2]);
+    if (sep < 55) {
+      const lum = 0.299 * bgRgb[0] + 0.587 * bgRgb[1] + 0.114 * bgRgb[2];
+      fgRgb = lum < 135 ? [255, 255, 255] : [15, 23, 42];
+    }
+
     return {
-      bgHex,
-      fgHex: luminance < 135 ? '#ffffff' : '#0f172a',
+      bgRgb,
+      fgRgb,
+      bgHex: rgbToHex(bgRgb[0], bgRgb[1], bgRgb[2]),
+      fgHex: rgbToHex(fgRgb[0], fgRgb[1], fgRgb[2]),
     };
   } catch {
-    return { bgHex: '#ffffff', fgHex: '#0f172a' };
+    return {
+      bgRgb: [255, 255, 255],
+      fgRgb: [15, 23, 42],
+      bgHex: '#ffffff',
+      fgHex: '#0f172a',
+    };
   }
 }
 
 /**
- * Converts normalized 0..1000 Gemini Vision bounding boxes into styled, editable TextBlocks
- * with sampled poster background & contrasting text colors.
+ * Erases ONLY the original text character strokes (including tall Vietnamese stacked diacritics!)
+ * inside a bounding box on `targetCtx` via Stroke-Mask Onion-Peel + Harmonic Diffusion Inpainting,
+ * preserving 100% of surrounding gradients, sunburst rays, fireworks, pill shapes, and borders!
+ */
+function inpaintTextStrokesInBox(
+  srcCtx: CanvasRenderingContext2D,
+  targetCtx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  scaleX: number,
+  scaleY: number,
+  bgRgb: [number, number, number],
+  fgRgb: [number, number, number]
+): void {
+  const cw = srcCtx.canvas.width;
+  const ch = srcCtx.canvas.height;
+
+  const coreX = Math.max(0, Math.floor(x * scaleX));
+  const coreY = Math.max(0, Math.floor(y * scaleY));
+  const coreW = Math.min(cw - coreX, Math.ceil(width * scaleX));
+  const coreH = Math.min(ch - coreY, Math.ceil(height * scaleY));
+  if (coreW < 4 || coreH < 4) return;
+
+  // Extra top/bottom pad captures tall Vietnamese diacritics (Ễ, Ộ, Ố, Ắ) & descenders (g, y, p, ự)
+  const padTop = Math.min(coreY, Math.max(6, Math.round(coreH * 0.34)));
+  const padBot = Math.min(ch - (coreY + coreH), Math.max(4, Math.round(coreH * 0.2)));
+  const padX = Math.min(coreX, Math.max(4, Math.round(coreH * 0.14)));
+
+  const px0 = Math.max(0, coreX - padX);
+  const py0 = Math.max(0, coreY - padTop);
+  const px1 = Math.min(cw, coreX + coreW + padX);
+  const py1 = Math.min(ch, coreY + coreH + padBot);
+  const pw = px1 - px0;
+  const ph = py1 - py0;
+  if (pw < 6 || ph < 6) return;
+
+  const srcData = srcCtx.getImageData(px0, py0, pw, ph).data;
+  const outImg = targetCtx.getImageData(px0, py0, pw, ph);
+  const out = outImg.data;
+
+  // mask: 0 = untouched background, 1 = ink stroke to fill, 2 = newly filled pixel
+  const mask = new Uint8Array(pw * ph);
+  const origMask = new Uint8Array(pw * ph);
+  const sep =
+    Math.abs(fgRgb[0] - bgRgb[0]) +
+    Math.abs(fgRgb[1] - bgRgb[1]) +
+    Math.abs(fgRgb[2] - bgRgb[2]);
+  const minBgDiff = Math.max(28, sep * 0.22);
+  const maxOuterInkDiff = Math.max(68, sep * 0.48);
+
+  const relCoreY0 = coreY - py0;
+  const relCoreY1 = relCoreY0 + coreH;
+  const relCoreX0 = coreX - px0;
+  const relCoreX1 = relCoreX0 + coreW;
+
+  for (let ry = 0; ry < ph; ry++) {
+    const inCoreY = ry >= relCoreY0 && ry < relCoreY1;
+    let rowMarked = 0;
+    for (let rx = 0; rx < pw; rx++) {
+      // Always keep the outermost 1px boundary unmasked as diffusion anchor
+      if (rx === 0 || ry === 0 || rx === pw - 1 || ry === ph - 1) continue;
+      const inCoreX = rx >= relCoreX0 && rx < relCoreX1;
+      const idx = (ry * pw + rx) * 4;
+      const r = srcData[idx];
+      const g = srcData[idx + 1];
+      const b = srcData[idx + 2];
+      const dBg = Math.abs(r - bgRgb[0]) + Math.abs(g - bgRgb[1]) + Math.abs(b - bgRgb[2]);
+      const dFg = Math.abs(r - fgRgb[0]) + Math.abs(g - fgRgb[1]) + Math.abs(b - fgRgb[2]);
+
+      if (inCoreY && inCoreX) {
+        if (dFg < dBg * 1.24 || dBg >= minBgDiff) {
+          mask[ry * pw + rx] = 1;
+          rowMarked++;
+        }
+      } else if (inCoreX) {
+        // Outer top/bottom diacritic band: only mark pixels genuinely matching the letter ink color!
+        if (dFg <= maxOuterInkDiff && dFg < dBg * 0.98) {
+          mask[ry * pw + rx] = 1;
+          rowMarked++;
+        }
+      }
+    }
+    // Protect container/pill horizontal border lines in the outer pad band (borders span >60% width; accents <35%)
+    if (!inCoreY && rowMarked > pw * 0.58) {
+      for (let rx = 0; rx < pw; rx++) {
+        mask[ry * pw + rx] = 0;
+      }
+    }
+  }
+
+  // Dilate mask by 2px (two 3x3 passes) so anti-aliased letter halos & JPEG ringing are 100% erased
+  for (let pass = 0; pass < 2; pass++) {
+    const dilated = new Uint8Array(mask);
+    for (let ry = 1; ry < ph - 1; ry++) {
+      for (let rx = 1; rx < pw - 1; rx++) {
+        const p = ry * pw + rx;
+        if (mask[p]) continue;
+        if (
+          mask[p - 1] ||
+          mask[p + 1] ||
+          mask[p - pw] ||
+          mask[p + pw] ||
+          mask[p - pw - 1] ||
+          mask[p - pw + 1] ||
+          mask[p + pw - 1] ||
+          mask[p + pw + 1]
+        ) {
+          dilated[p] = 1;
+        }
+      }
+    }
+    mask.set(dilated);
+  }
+  origMask.set(mask);
+
+  // Step 1: Onion-peel inward boundary filling (fills thin strokes from surrounding background in ~6-12 peels)
+  const dirs = [
+    [-1, 0, 1.4],
+    [1, 0, 1.4],
+    [0, -1, 1.4],
+    [0, 1, 1.4],
+    [-1, -1, 1.0],
+    [1, -1, 1.0],
+    [-1, 1, 1.0],
+    [1, 1, 1.0],
+  ] as const;
+
+  for (let peel = 0; peel < 64; peel++) {
+    const frontier: number[] = [];
+    for (let ry = 1; ry < ph - 1; ry++) {
+      for (let rx = 1; rx < pw - 1; rx++) {
+        const p = ry * pw + rx;
+        if (mask[p] !== 1) continue;
+        if (
+          mask[p - 1] === 0 ||
+          mask[p + 1] === 0 ||
+          mask[p - pw] === 0 ||
+          mask[p + pw] === 0 ||
+          mask[p - pw - 1] === 0 ||
+          mask[p - pw + 1] === 0 ||
+          mask[p + pw - 1] === 0 ||
+          mask[p + pw + 1] === 0
+        ) {
+          frontier.push(p);
+        }
+      }
+    }
+    if (frontier.length === 0) break;
+
+    for (const p of frontier) {
+      const ry = Math.floor(p / pw);
+      const rx = p - ry * pw;
+      let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
+      for (const [dx, dy, w] of dirs) {
+        const np = (ry + dy) * pw + (rx + dx);
+        if (mask[np] === 0) {
+          const nIdx = np * 4;
+          rSum += out[nIdx] * w;
+          gSum += out[nIdx + 1] * w;
+          bSum += out[nIdx + 2] * w;
+          wSum += w;
+        }
+      }
+      if (wSum > 0) {
+        const pIdx = p * 4;
+        out[pIdx] = Math.round(rSum / wSum);
+        out[pIdx + 1] = Math.round(gSum / wSum);
+        out[pIdx + 2] = Math.round(bSum / wSum);
+        out[pIdx + 3] = 255;
+      }
+    }
+    for (const p of frontier) {
+      mask[p] = 0;
+    }
+  }
+
+  // Fallback for any isolated interior pixels if entire patch had no unmasked boundary
+  for (let p = 0; p < pw * ph; p++) {
+    if (mask[p] === 1) {
+      const pIdx = p * 4;
+      out[pIdx] = bgRgb[0];
+      out[pIdx + 1] = bgRgb[1];
+      out[pIdx + 2] = bgRgb[2];
+      out[pIdx + 3] = 255;
+    }
+  }
+
+  // Step 2: 10 Laplace harmonic smoothing passes on originally-masked pixels for silky gradient continuity
+  const temp = new Uint8ClampedArray(out);
+  for (let it = 0; it < 10; it++) {
+    for (let ry = 1; ry < ph - 1; ry++) {
+      for (let rx = 1; rx < pw - 1; rx++) {
+        const p = ry * pw + rx;
+        if (!origMask[p]) continue;
+        const pIdx = p * 4;
+        const lIdx = (p - 1) * 4;
+        const rIdx = (p + 1) * 4;
+        const uIdx = (p - pw) * 4;
+        const dIdx = (p + pw) * 4;
+        temp[pIdx] = (out[lIdx] + out[rIdx] + out[uIdx] + out[dIdx]) >> 2;
+        temp[pIdx + 1] = (out[lIdx + 1] + out[rIdx + 1] + out[uIdx + 1] + out[dIdx + 1]) >> 2;
+        temp[pIdx + 2] = (out[lIdx + 2] + out[rIdx + 2] + out[uIdx + 2] + out[dIdx + 2]) >> 2;
+      }
+    }
+    out.set(temp);
+  }
+
+  targetCtx.putImageData(outImg, px0, py0);
+}
+
+/**
+ * Converts normalized 0..1000 Gemini Vision bounding boxes into 100% transparent-background TextBlocks
+ * AND seamlessly inpaints all original text strokes out of the page background!
  */
 export async function buildVisionOcrTextBlocks(
   page: PageData,
   rawBoxes: VisionDetectedBox[]
-): Promise<TextBlock[]> {
-  if (!rawBoxes || rawBoxes.length === 0) return [];
+): Promise<{ blocks: TextBlock[]; cleanBackgroundDataUrl: string }> {
+  if (!rawBoxes || rawBoxes.length === 0) {
+    return { blocks: [], cleanBackgroundDataUrl: page.backgroundDataUrl };
+  }
 
   return new Promise((resolve) => {
     const img = new Image();
-    img.onerror = () => resolve([]);
+    img.onerror = () =>
+      resolve({ blocks: [], cleanBackgroundDataUrl: page.backgroundDataUrl });
     img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0);
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = img.width;
+      srcCanvas.height = img.height;
+      const srcCtx = srcCanvas.getContext('2d')!;
+      srcCtx.drawImage(img, 0, 0);
+
+      const cleanCanvas = document.createElement('canvas');
+      cleanCanvas.width = img.width;
+      cleanCanvas.height = img.height;
+      const cleanCtx = cleanCanvas.getContext('2d')!;
+      cleanCtx.drawImage(img, 0, 0);
 
       const scaleX = img.width / page.width;
       const scaleY = img.height / page.height;
@@ -1268,14 +1564,27 @@ export async function buildVisionOcrTextBlocks(
           Math.max(14, Math.round(((ymax - ymin) / 1000) * page.height) + 3)
         );
 
-        const { bgHex, fgHex } = sampleSmartVisionColors(
-          ctx,
+        const { bgRgb, fgRgb, bgHex, fgHex } = separateBgAndInkColors(
+          srcCtx,
           x,
           y,
           width,
           height,
           scaleX,
           scaleY
+        );
+
+        inpaintTextStrokesInBox(
+          srcCtx,
+          cleanCtx,
+          x,
+          y,
+          width,
+          height,
+          scaleX,
+          scaleY,
+          bgRgb,
+          fgRgb
         );
 
         const lineCount = Math.max(
@@ -1313,7 +1622,7 @@ export async function buildVisionOcrTextBlocks(
           fontStyle: 'normal',
           color: fgHex,
           backgroundColor: bgHex,
-          bgOpacity: 1,
+          bgOpacity: 0,
           textAlign,
           lineHeight: 1.18,
           padding: 2,
@@ -1322,7 +1631,83 @@ export async function buildVisionOcrTextBlocks(
         });
       });
 
-      resolve(blocks);
+      resolve({
+        blocks,
+        cleanBackgroundDataUrl: cleanCanvas.toDataURL('image/png'),
+      });
+    };
+    img.src = page.backgroundDataUrl;
+  });
+}
+
+/**
+ * Seamlessly erases original text strokes on ANY page (including standard text-layer PDFs)
+ * and sets all textBlocks to 100% transparent background (`bgOpacity: 0`).
+ */
+export async function removeTextBackgroundsOnPage(page: PageData): Promise<PageData> {
+  if (!page.textBlocks || page.textBlocks.length === 0) return page;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onerror = () => resolve(page);
+    img.onload = () => {
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = img.width;
+      srcCanvas.height = img.height;
+      const srcCtx = srcCanvas.getContext('2d')!;
+      srcCtx.drawImage(img, 0, 0);
+
+      const cleanCanvas = document.createElement('canvas');
+      cleanCanvas.width = img.width;
+      cleanCanvas.height = img.height;
+      const cleanCtx = cleanCanvas.getContext('2d')!;
+      cleanCtx.drawImage(img, 0, 0);
+
+      const scaleX = img.width / page.width;
+      const scaleY = img.height / page.height;
+
+      const updatedBlocks = page.textBlocks.map((tb) => {
+        const bx = tb.origWidth > 0 ? tb.origX : tb.x;
+        const by = tb.origHeight > 0 ? tb.origY : tb.y;
+        const bw = tb.origWidth > 0 ? tb.origWidth : tb.width;
+        const bh = tb.origHeight > 0 ? tb.origHeight : tb.height;
+
+        const { bgRgb, fgRgb, bgHex, fgHex } = separateBgAndInkColors(
+          srcCtx,
+          bx,
+          by,
+          bw,
+          bh,
+          scaleX,
+          scaleY
+        );
+
+        inpaintTextStrokesInBox(
+          srcCtx,
+          cleanCtx,
+          bx,
+          by,
+          bw,
+          bh,
+          scaleX,
+          scaleY,
+          bgRgb,
+          fgRgb
+        );
+
+        return {
+          ...tb,
+          backgroundColor: bgHex,
+          color: tb.color || fgHex,
+          bgOpacity: 0,
+        };
+      });
+
+      resolve({
+        ...page,
+        cleanBackgroundDataUrl: cleanCanvas.toDataURL('image/png'),
+        textBlocks: updatedBlocks,
+      });
     };
     img.src = page.backgroundDataUrl;
   });

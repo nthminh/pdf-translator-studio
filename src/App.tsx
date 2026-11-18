@@ -12,6 +12,7 @@ import {
   parsePdfFile,
   parseImageFile,
   buildVisionOcrTextBlocks,
+  removeTextBackgroundsOnPage,
   createSampleDocumentPages,
   snipImageRegionFromPage,
   exportPagesToPdf,
@@ -43,6 +44,7 @@ import {
   RotateCcw,
   BoxSelect,
   ScanText,
+  Eraser,
 } from 'lucide-react';
 
 export const App: React.FC = () => {
@@ -159,25 +161,46 @@ export const App: React.FC = () => {
         return;
       }
 
-      const rawVisionBlocks = await buildVisionOcrTextBlocks(
-        currentPage,
-        detectedBoxes
-      );
+      const { blocks: rawVisionBlocks, cleanBackgroundDataUrl } =
+        await buildVisionOcrTextBlocks(currentPage, detectedBoxes);
       const fittedBlocks = rawVisionBlocks.map((tb) => fitTextBlock(tb));
       setViewMode('translated');
+      setShowBoundingBoxes(false);
 
       setPages((prev) =>
         prev.map((p, idx) =>
-          idx === currentPageIdx ? { ...p, textBlocks: fittedBlocks } : p
+          idx === currentPageIdx
+            ? { ...p, cleanBackgroundDataUrl, textBlocks: fittedBlocks }
+            : p
         )
       );
 
       const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(2);
       setLastStats(
-        `✨ AI Vision đã quét & dịch ${fittedBlocks.length} vùng chữ trong ${elapsedSec}s!`
+        `✨ AI Vision đã tách nền chữ trong suốt & dịch ${fittedBlocks.length} vùng chữ trong ${elapsedSec}s!`
       );
     } catch (err: any) {
       alert('Lỗi quét chữ AI Vision: ' + (err?.message || String(err)));
+    } finally {
+      setIsBusy(false);
+      setStatusMessage('');
+    }
+  };
+
+  // One-click seamless background removal (Inpaint away original letters + set bgOpacity=0 on all TextBlocks)
+  const handleRemoveAllTextBackgrounds = async () => {
+    if (!currentPage || isBusy || currentPage.textBlocks.length === 0) return;
+    setIsBusy(true);
+    setStatusMessage('🧹 Đang tự động xóa chữ gốc khỏi nền ảnh & làm trong suốt toàn bộ khung chữ...');
+    try {
+      const cleanedPage = await removeTextBackgroundsOnPage(currentPage);
+      setShowBoundingBoxes(false);
+      setPages((prev) =>
+        prev.map((p, idx) => (idx === currentPageIdx ? cleanedPage : p))
+      );
+      setLastStats('✨ Đã tự động xóa nền toàn bộ khung chữ (trong suốt 100%, giữ nguyên họa tiết nền)!');
+    } catch (err: any) {
+      alert('Lỗi khi tách nền khung chữ: ' + (err?.message || String(err)));
     } finally {
       setIsBusy(false);
       setStatusMessage('');
@@ -201,8 +224,11 @@ export const App: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      // 1. Automatically run AI Vision OCR + Translation on any Poster / Scan / Image PDF pages (0 text layer items)
-      const visionBlocksByPage = new Map<number, TextBlock[]>();
+      // 1. Automatically run AI Vision OCR + Seamless Stroke Inpainting + Translation on Poster / Scan / Image PDF pages
+      const visionResultByPage = new Map<
+        number,
+        { blocks: TextBlock[]; cleanBackgroundDataUrl: string }
+      >();
       let visionTotalCount = 0;
 
       if (visionTargetIndices.length > 0) {
@@ -211,7 +237,7 @@ export const App: React.FC = () => {
           const pageObj = pages[pIdx];
           if (!pageObj) continue;
           setStatusMessage(
-            `🔍 Phát hiện PDF dạng Ảnh/Poster — AI đang quét chữ & dịch trang ${i + 1}/${visionTargetIndices.length}...`
+            `🔍 Đang quét chữ, tự động tách nền trong suốt & dịch trang ${i + 1}/${visionTargetIndices.length}...`
           );
           const detectedBoxes = await visionOcrAndTranslatePage({
             backgroundDataUrl: pageObj.backgroundDataUrl,
@@ -220,11 +246,16 @@ export const App: React.FC = () => {
             engine,
             apiKey,
           });
-          const rawBlocks = await buildVisionOcrTextBlocks(pageObj, detectedBoxes);
+          const { blocks: rawBlocks, cleanBackgroundDataUrl } =
+            await buildVisionOcrTextBlocks(pageObj, detectedBoxes);
           const fitted = rawBlocks.map((tb) => fitTextBlock(tb));
-          visionBlocksByPage.set(pIdx, fitted);
+          visionResultByPage.set(pIdx, {
+            blocks: fitted,
+            cleanBackgroundDataUrl,
+          });
           visionTotalCount += fitted.length;
         }
+        setShowBoundingBoxes(false);
       }
 
       // 2. Translate standard selectable text blocks (if any)
@@ -249,10 +280,12 @@ export const App: React.FC = () => {
           const isTargetPage = allPages || p.pageIndex === currentPageIdx;
           if (!isTargetPage) return p;
 
-          if (visionBlocksByPage.has(p.pageIndex)) {
+          if (visionResultByPage.has(p.pageIndex)) {
+            const vRes = visionResultByPage.get(p.pageIndex)!;
             return {
               ...p,
-              textBlocks: visionBlocksByPage.get(p.pageIndex) || [],
+              cleanBackgroundDataUrl: vRes.cleanBackgroundDataUrl,
+              textBlocks: vRes.blocks,
             };
           }
 
@@ -573,6 +606,7 @@ export const App: React.FC = () => {
         if (idx !== currentPageIdx) return p;
         return {
           ...p,
+          cleanBackgroundDataUrl: undefined,
           textBlocks: p.textBlocks.map((tb) => ({
             ...tb,
             x: tb.origX,
@@ -581,6 +615,7 @@ export const App: React.FC = () => {
             height: tb.origHeight,
             translatedText: tb.originalText,
             fontSize: tb.originalFontSize,
+            bgOpacity: 1,
             isTranslated: false,
           })),
         };
@@ -804,10 +839,20 @@ export const App: React.FC = () => {
             disabled={isBusy}
             onClick={handleVisionOcrCurrentPage}
             className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-amber-300 disabled:opacity-50 flex items-center gap-1.5 font-medium transition"
-            title="Quét nhận diện chữ bằng AI Vision cho file PDF dạng ảnh phẳng / Poster thiết kế Canva / File Scan"
+            title="Quét nhận diện chữ bằng AI Vision & tự động xóa nền khung chữ cho Poster / Scan"
           >
             <ScanText className="w-3.5 h-3.5" />
             Quét Chữ AI (Poster/Scan)
+          </button>
+
+          <button
+            disabled={isBusy || !currentPage || currentPage.textBlocks.length === 0}
+            onClick={handleRemoveAllTextBackgrounds}
+            className="px-2.5 py-1 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 border border-teal-500/35 text-teal-300 disabled:opacity-40 flex items-center gap-1.5 font-medium transition"
+            title="Tự động xóa nét chữ gốc trên nền ảnh & làm trong suốt 100% nền của mọi khung chữ (giữ nguyên pháo hoa, chuyển sắc, họa tiết nền)"
+          >
+            <Eraser className="w-3.5 h-3.5" />
+            Xóa Nền Khung Chữ
           </button>
 
           <button
